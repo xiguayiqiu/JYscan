@@ -1,0 +1,7 @@
+{
+  // Java 扩展（jdtls）默认把编译产物写进 target/classes，会与 Maven 的
+  // javac 产物互相覆盖（jdtls 用 ECJ，出错的类会写出
+  // "Unresolved compilation problems" 的假类）。这里让两者分离。
+  "java.project.outputPath": ".jdtls-output",
+  "java.configuration.updateBuildConfiguration": "automatic"
+}

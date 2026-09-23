@@ -1,0 +1,5 @@
+target/
+.jdtls-output/
+*.class
+freeclient/
+README-GYscan.md

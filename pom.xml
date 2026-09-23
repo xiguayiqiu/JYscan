@@ -1,0 +1,158 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>space.jyscan</groupId>
+  <artifactId>JYscan</artifactId>
+  <packaging>jar</packaging>
+  <version>1.0-SNAPSHOT</version>
+  <name>JYscan</name>
+
+  <!-- 全局属性：编译版本 + 编码 -->
+  <properties>
+    <!-- 本机 JDK 26，release 取 17 保证字节码兼容 -->
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <picocli.version>4.7.6</picocli.version>
+    <jackson.version>2.19.2</jackson.version>
+    <mainClass>space.jyscan.Main</mainClass>
+  </properties>
+
+  <dependencies>
+    <!-- 命令行框架：Picocli -->
+    <dependency>
+      <groupId>info.picocli</groupId>
+      <artifactId>picocli</artifactId>
+      <version>${picocli.version}</version>
+    </dependency>
+
+    <!-- JSON 序列化/反序列化（对应 Go encoding/json） -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+
+    <!-- HTML 解析（对应 Go goquery/golang.org/x/net/html） -->
+    <dependency>
+      <groupId>org.jsoup</groupId>
+      <artifactId>jsoup</artifactId>
+      <version>1.18.3</version>
+    </dependency>
+
+    <!-- YAML 解析（nuclei 模板 / 配置） -->
+    <dependency>
+      <groupId>org.yaml</groupId>
+      <artifactId>snakeyaml</artifactId>
+      <version>2.3</version>
+    </dependency>
+
+    <!-- DNS 记录查询（A/AAAA/MX/TXT/NS/SOA/CNAME/PTR 等） -->
+    <dependency>
+      <groupId>dnsjava</groupId>
+      <artifactId>dnsjava</artifactId>
+      <version>3.6.3</version>
+    </dependency>
+
+    <!-- 原生调用（raw socket / ICMP traceroute，对应 Go 的 golang.org/x/net/icmp） -->
+    <dependency>
+      <groupId>net.java.dev.jna</groupId>
+      <artifactId>jna</artifactId>
+      <version>5.14.0</version>
+    </dependency>
+    <dependency>
+      <groupId>net.java.dev.jna</groupId>
+      <artifactId>jna-platform</artifactId>
+      <version>5.14.0</version>
+    </dependency>
+
+    <!-- 测试框架（原 junit 3.8.1 太旧，升级为 JUnit 5） -->
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.10.2</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- 打包可执行 fat-jar：把 picocli 一起打进去并写入 Main-Class -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.5.1</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals><goal>shade</goal></goals>
+            <configuration>
+              <transformers>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                  <mainClass>${mainClass}</mainClass>
+                  <manifestEntries>
+                    <!--
+                      关键：7 个依赖（picocli/jackson/jsoup/snakeyaml/dnsjava 等）都是
+                      multi-release JAR，版本化类位于 META-INF/versions/18/ 下。
+                      shade 默认不保留该 manifest 属性，导致 JVM 忽略 versions 目录，
+                      dnsjava 的 DnsjavaInetAddressResolverProvider 找不到 -> ServiceLoader
+                      报 "provider not found" -> 整个 JVM 的 InetAddress/DNS 解析崩溃
+                      （route/ssl/whois 等全部失败）。
+                    -->
+                    <Multi-Release>true</Multi-Release>
+                  </manifestEntries>
+                </transformer>
+              </transformers>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!-- 支持 mvn exec:java 直接运行 -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>exec-maven-plugin</artifactId>
+        <version>3.1.1</version>
+        <configuration>
+          <mainClass>${mainClass}</mainClass>
+        </configuration>
+      </plugin>
+
+      <!-- 测试 -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
+      </plugin>
+    </plugins>
+
+    <!-- 嵌入式资源：WAF 规则 / 目录字典，对应 Go 的 //go:embed -->
+    <resources>
+      <resource>
+        <directory>src/main/resources</directory>
+      </resource>
+      <resource>
+        <directory>freeclient/internal/utils/embed_resources</directory>
+        <targetPath>embed_resources</targetPath>
+      </resource>
+      <!-- freeclient/script（YScript 示例脚本 + README）刻意不打包：
+           1) script 选项已放弃移植，这些资源当前无任何 Java 调用方；
+           2) freeclient/ 整棵树按约定不改名（仅作 Go 参考源），其中 7 个文件
+              含 39 处未随本项目改名的旧品牌串，打进 jar 会让产物显示他方品牌
+              （内含 2 处脚本真会发出的 HTTP User-Agent 字节）。
+           将来移植脚本引擎时：先对 freeclient/script 完成品牌改名（旧品牌 → JYscan），
+           再恢复下面这段 resource。
+      <resource>
+        <directory>freeclient/script</directory>
+        <targetPath>script</targetPath>
+      </resource>
+      -->
+      <resource>
+        <directory>freeclient/dirmap</directory>
+        <targetPath>dirmap</targetPath>
+      </resource>
+    </resources>
+  </build>
+</project>
