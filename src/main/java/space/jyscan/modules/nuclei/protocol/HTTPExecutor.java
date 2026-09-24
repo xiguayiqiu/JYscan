@@ -19,6 +19,11 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * HTTP 协议执行器，对应 Go 的 {@code protocol.HTTPExecutor}。
@@ -30,8 +35,10 @@ import java.util.Set;
  * <ul>
  *   <li>{@code TLSClientConfig: InsecureSkipVerify: true} → {@link TrustAll#context()}（信任全部证书）；</li>
  *   <li>{@code Dialer{Timeout: 10s, KeepAlive: 30s}} → {@code HttpClient.connectTimeout(10s)}（KeepAlive 无对应可配项）；</li>
- *   <li>{@code Client{Timeout: 10s}} → 每个请求 {@code HttpRequest.timeout(10s)}；
- *       Java 侧覆盖到「收到响应头」，响应体读取无总超时（已知偏差，见 {@code readLimited}）；</li>
+ *   <li>{@code Client{Timeout: 10s}} → 每跳一份 {@code hopDeadline = now+10s}：响应头阶段
+ *       {@code HttpRequest.timeout(10s)}（JDK 计时器）+ {@code sendAsync.get(+2s)} 自有时钟兜底；
+ *       响应体读取同样受该跳剩余预算约束（看门线程限时，见 {@code readLimited}）——
+ *       与 Go {@code Client.Timeout} 全程覆盖对齐，半开连接/对端静默不再可能无限期阻塞；</li>
  *   <li>{@code CheckRedirect: len(via) >= 10 即 http.ErrUseLastResponse} →
  *       {@code Redirect.NEVER} + 手动重定向循环，上限 10（同样按「已发请求书 &gt;= 上限即停止」计数，
  *       实际最多跟随 9 次跳转）；</li>
@@ -192,28 +199,32 @@ public class HTTPExecutor {
         byte[] currentBody = body;
         int followed = 0;
         while (true) {
+            // Go 每次 client.Do 独享一份 Client.Timeout(10s)：发起→收头→读完 body 全程计时。
+            // JDK 的 HttpRequest.timeout 只到响应头且依赖内部计时器，这里用自有时钟对
+            // 「等待响应头」兜底、对「读取响应体」强制同跳剩余预算（修复卡死类缺陷）。
+            long hopDeadline = System.nanoTime() + REQUEST_TIMEOUT.toNanos();
             HttpRequest httpReq = buildRequest(currentUri, currentMethod, currentBody, headers, cookies,
                     !currentHost.equals(originalHost));
-            HttpResponse<InputStream> resp = client.send(httpReq, HttpResponse.BodyHandlers.ofInputStream());
+            HttpResponse<InputStream> resp = sendWithDeadline(httpReq);
             int code = resp.statusCode();
             Optional<String> location = resp.headers().firstValue("Location");
             if (!isRedirect(code) || location.isEmpty()) {
-                return new Exchange(code, resp.headers(), readLimited(resp.body(), maxBody));
+                return new Exchange(code, resp.headers(), readLimited(resp.body(), maxBody, hopDeadline));
             }
             // Go: len(via) >= cap → ErrUseLastResponse（返回最后一次响应）
             if (followed + 1 >= policy.cap()) {
-                return new Exchange(code, resp.headers(), readLimited(resp.body(), maxBody));
+                return new Exchange(code, resp.headers(), readLimited(resp.body(), maxBody, hopDeadline));
             }
             URI next;
             try {
                 next = currentUri.resolve(location.get());
             } catch (IllegalArgumentException e) {
                 // Go: resp.Location() 解析失败 → 不再跟随，返回当前响应
-                return new Exchange(code, resp.headers(), readLimited(resp.body(), maxBody));
+                return new Exchange(code, resp.headers(), readLimited(resp.body(), maxBody, hopDeadline));
             }
             String nextHost = hostKey(next);
             if (policy.stopOnHostChange() && !nextHost.equals(currentHost)) {
-                return new Exchange(code, resp.headers(), readLimited(resp.body(), maxBody));
+                return new Exchange(code, resp.headers(), readLimited(resp.body(), maxBody, hopDeadline));
             }
             // Go 会排空并关闭中间跳转的响应体以复用连接
             resp.body().close();
@@ -282,13 +293,80 @@ public class HTTPExecutor {
     }
 
     /**
-     * 按 {@code GetMaxSize} 上限读取响应体。
+     * 发送单跳请求，并用自有时钟兜底 Go {@code Client.Timeout} 的「等待响应头」阶段。
+     *
+     * <p>JDK 的 {@code HttpRequest.timeout} 正常会先触发（错误信息更准）；这里在
+     * {@code sendAsync} 之上再加一层 {@code get(10s+2s)}，到期 {@code cancel(true)}，
+     * 保证调用线程在任何情况下（计时器失效、对端静默）都有限时返回。
+     */
+    private HttpResponse<InputStream> sendWithDeadline(HttpRequest httpReq)
+            throws IOException, InterruptedException {
+        CompletableFuture<HttpResponse<InputStream>> pending =
+                client.sendAsync(httpReq, HttpResponse.BodyHandlers.ofInputStream());
+        try {
+            // 2s 退避：留给 JDK 自带超时（10s）先触发，本层仅兜底
+            return pending.get(REQUEST_TIMEOUT.toNanos() + 2_000_000_000L, TimeUnit.NANOSECONDS);
+        } catch (TimeoutException e) {
+            pending.cancel(true);
+            throw new IOException("context deadline exceeded "
+                    + "(Client.Timeout exceeded while awaiting headers)", e);
+        } catch (ExecutionException e) {
+            Throwable c = e.getCause();
+            if (c instanceof IOException ioe) {
+                throw ioe;
+            }
+            if (c instanceof RuntimeException re) {
+                throw re;
+            }
+            throw new IOException(c);
+        }
+    }
+
+    /**
+     * 按 {@code GetMaxSize} 上限读取响应体，并受该跳剩余预算约束。
      *
      * <p>对应 Go {@code io.ReadAll(io.LimitReader(resp.Body, int64(req.GetMaxSize())))}。
-     * 已知偏差：Go 的 {@code Client.Timeout: 10s} 覆盖到响应体读取，Java 侧
-     * {@code HttpRequest.timeout} 只覆盖到响应头。
+     * Go 的 {@code Client.Timeout} 同样覆盖响应体读取，而 JDK 的响应体流没有读取超时——
+     * 对端发完响应头后悬挂会让 {@code readNBytes} 无限期阻塞。故用看门线程限时读取，
+     * 到期 {@code interrupt + close} 唤醒（响应体流的阻塞点可被中断/关闭解除）。
      */
-    private static String readLimited(InputStream in, int maxBody) throws IOException {
+    private static String readLimited(InputStream in, int maxBody, long hopDeadline)
+            throws IOException, InterruptedException {
+        FutureTask<String> readTask = new FutureTask<>(() -> readLimitedNow(in, maxBody));
+        Thread reader = new Thread(readTask, "jyscan-http-body-read");
+        reader.setDaemon(true);
+        reader.start();
+        try {
+            long budget = Math.max(0L, hopDeadline - System.nanoTime());
+            return readTask.get(budget, TimeUnit.NANOSECONDS);
+        } catch (TimeoutException e) {
+            readTask.cancel(true);
+            try {
+                in.close();
+            } catch (IOException ignored) {
+                // 唤醒阻塞中的读取；失败也无妨，读线程是 daemon
+            }
+            throw new IOException("context deadline exceeded "
+                    + "(Client.Timeout exceeded while reading body)", e);
+        } catch (ExecutionException e) {
+            Throwable c = e.getCause();
+            if (c instanceof IOException ioe) {
+                throw ioe;
+            }
+            throw new IOException(c);
+        } catch (InterruptedException e) {
+            readTask.cancel(true);
+            try {
+                in.close();
+            } catch (IOException ignored) {
+                // 同上
+            }
+            throw e;
+        }
+    }
+
+    /** 原读取实现（上限 + UTF-8），由 {@link #readLimited} 限时调度。 */
+    private static String readLimitedNow(InputStream in, int maxBody) throws IOException {
         try (InputStream stream = in) {
             int limit = maxBody > 0 ? maxBody : Integer.MAX_VALUE;
             return new String(stream.readNBytes(limit), StandardCharsets.UTF_8);

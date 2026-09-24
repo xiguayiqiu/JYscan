@@ -272,7 +272,7 @@ final class Zh {
         MESSAGES.put("nuclei.err.no-executable", "未发现可执行的模板");
         MESSAGES.put("nuclei.err.create-output", "创建输出文件失败: %v");
 
-        MESSAGES.put("nuclei.log.version", "当前 nuclei 版本: v3.11.0 (最新版)");
+        // MESSAGES.put("nuclei.log.version", "当前 nuclei 版本: v3.11.0 (最新版)");
         MESSAGES.put("nuclei.log.template-version", "当前 nuclei 模板版本: v10.4.5 (最新版)");
         MESSAGES.put("nuclei.log.new-templates", "最新发布中新增的模板: 86");
         MESSAGES.put("nuclei.log.loaded-templates", "当前扫描已加载模板: %d");

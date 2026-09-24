@@ -18,6 +18,7 @@ public class Main {
 
     public static void main(String[] args) {
         setupEncoding();
+        preloadDnsjavaShutdownClasses();
 
         // 配置初始化失败只告警，不阻断（与 Go 一致）
         try {
@@ -29,6 +30,30 @@ public class Main {
         int code = Cli.run(args);
         if (code != 0) {
             System.exit(code);
+        }
+    }
+
+    /**
+     * 预加载 dnsjava NioTcpClient 关闭钩子在<b>退出时</b>才链接的内部类。
+     *
+     * <p>{@code SimpleResolver} 构造时即注册 “dnsjava NIO shutdown hook”（经
+     * {@code DefaultIoClient} → {@code new NioTcpClient()} → {@code setCloseTask}），
+     * 而 {@code closeTcp} 体内的 invokedynamic 要到 JVM 退出执行钩子时才首次解析
+     * {@code NioTcpClient$ChannelKey} 等类。若运行期间 jar 被重建（如 {@code mvn package}
+     * 覆盖 {@code target/JYscan-3.6.jar}），退出时按 jar 重查该类会失败，抛出
+     * {@code NoClassDefFoundError} 噪音（已复现：探针运行中并发 mvn 必现；干净运行为 0）。
+     * 启动时预加载后走 {@code findLoadedClass} 缓存，不再触碰 jar 文件。失败静默，不阻断启动。
+     */
+    private static void preloadDnsjavaShutdownClasses() {
+        for (String name : new String[]{
+                "org.xbill.DNS.NioTcpClient$ChannelKey",
+                "org.xbill.DNS.NioTcpClient$ChannelState",
+                "org.xbill.DNS.NioTcpClient$Transaction"}) {
+            try {
+                Class.forName(name);
+            } catch (Throwable ignored) {
+                // dnsjava 不可用/类缺失时静默跳过
+            }
         }
     }
 

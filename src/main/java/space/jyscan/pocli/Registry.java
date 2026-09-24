@@ -64,9 +64,9 @@ public final class Registry {
         // ==================== Web ====================
         register("webshell", CommandGroup.WEB, new WebshellCommand());
         register("waf", CommandGroup.WEB, new WafCommand());
+        register("nuclei", CommandGroup.WEB, new NucleiCommand());
 
         // ==================== 测试阶段命令 ====================
-        register("nuclei", CommandGroup.TESTING, new NucleiCommand());
     }
 
     private Registry() {

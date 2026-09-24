@@ -224,8 +224,7 @@ public class NucleiCommand implements Callable<Integer> {
             return 1;
         }
 
-        // nuclei 官方日志: 启动时显示版本信息
-        nl.info(I18n.T("nuclei.log.version"));
+        // 启动时显示版本信息（nuclei.log.version 按需求删除，不再显示）
         nl.info(I18n.T("nuclei.log.template-version"));
         nl.info(I18n.T("nuclei.log.new-templates"));
 
