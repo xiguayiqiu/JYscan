@@ -195,7 +195,7 @@ public class SubCommand implements Callable<Integer> {
                 if (done.await(2, TimeUnit.SECONDS)) {
                     List<SubdomainResult> results =
                             resultsRef.get() == null ? List.of() : resultsRef.get();
-                    printResults(results);
+                    // 命中行已在扫描过程中实时打印，这里只报统计
                     Colors.successPrint("\n扫描中断，共发现 %d 个子域名", results.size());
                 } else {
                     Colors.errorPrint("扫描线程未能及时停止");
@@ -232,34 +232,10 @@ public class SubCommand implements Callable<Integer> {
             return 1;
         }
 
-        printResults(results);
+        // 命中行已在扫描过程中实时打印（发现即显示），收尾只报统计，不再重复列表
         Colors.successPrint("\n扫描完成! 共发现 %d 个子域名 (耗时: %v)",
                 results.size(), SubdomainScanner.getScanDuration());
         return 0;
-    }
-
-    /** 打印命中列表，对应 Go cmd.go 里两处重复的结果循环。 */
-    private static void printResults(List<SubdomainResult> results) {
-        Colors.infoPrint("\n已发现的子域名:");
-        for (SubdomainResult result : results) {
-            if (result.httpStatus > 0) {
-                String coloredStatus = statusColor(result.httpStatus);
-                System.out.printf("%s %s%n", coloredStatus, Colors.highlight("%s", result.subdomain));
-            } else {
-                System.out.printf("%s -> %s%n", Colors.highlight("%s", result.subdomain), result.ip);
-            }
-        }
-    }
-
-    /** 状态码着色：2xx 绿、3xx 黄、其余红（对应 Go 的 switch）。 */
-    private static String statusColor(int status) {
-        if (status >= 200 && status < 300) {
-            return Colors.success("%d", status);
-        }
-        if (status >= 300 && status < 400) {
-            return Colors.warning("%d", status);
-        }
-        return Colors.error("%d", status);
     }
 
     /** 取异常消息（空消息回退到类名），对应 Go 的 err.Error()。 */

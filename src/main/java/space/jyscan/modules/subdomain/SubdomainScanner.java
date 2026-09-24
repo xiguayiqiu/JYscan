@@ -57,7 +57,9 @@ import java.util.regex.Pattern;
  *       这里按 flag 文档在扫描结束后调用一次；</li>
  *   <li>DNS 服务器：Go 硬编码 8.8.8.8；国内实测其丢包约 20%、RTT 均值 572ms
  *       （系统 resolver 24ms 零失败），在 1s 读超时下子域名被随机丢弃。
- *       这里改为系统 resolver 优先 + 8.8.8.8 兜底，失败自动换下一家。</li>
+ *       这里改为系统 resolver 优先 + 8.8.8.8 兜底，失败自动换下一家；</li>
+ *   <li>实时显示：Go 只在扫描结束后由 cmd.go 集中打印一次命中列表；
+ *       这里每命中一条立刻打印一行（收尾只报统计，不重复列表）。</li>
  * </ul>
  */
 public final class SubdomainScanner {
@@ -421,13 +423,19 @@ public final class SubdomainScanner {
                 return;
             }
             synchronized (mutex) {
-                allResults.add(new SubdomainResult(target, ip, httpStatus));
+                SubdomainResult result = new SubdomainResult(target, ip, httpStatus);
+                allResults.add(result);
                 foundCount.incrementAndGet();
+                // 与 Go 的有意偏差：发现即实时打印（Go 只在扫描结束后集中打印）
+                printFoundLive(result);
             }
         } else {
             synchronized (mutex) {
-                allResults.add(new SubdomainResult(target, ip));
+                SubdomainResult result = new SubdomainResult(target, ip);
+                allResults.add(result);
                 foundCount.incrementAndGet();
+                // 与 Go 的有意偏差：发现即实时打印（Go 只在扫描结束后集中打印）
+                printFoundLive(result);
             }
         }
 
@@ -503,6 +511,40 @@ public final class SubdomainScanner {
         }
 
         return 0;
+    }
+
+    /**
+     * 实时打印命中的子域名（发现即显示，不再等扫描结束）。
+     *
+     * <p>与 Go 的有意偏差：Go 只在扫描结束后由 cmd.go 集中打印一次列表；
+     * 这里每命中一条立刻输出一行，行格式与原收尾清单完全一致。
+     * 前缀 {@code \r ESC[K} 先清掉 stderr 进度条当前帧，避免结果行被拼接到
+     * 进度帧行尾部；下一个进度 tick 会在新行继续画条。
+     *
+     * @param result 命中结果（调用方需持有 {@link #mutex}）
+     */
+    private void printFoundLive(SubdomainResult result) {
+        StringBuilder line = new StringBuilder();
+        if (result.httpStatus > 0) {
+            line.append(statusColor(result.httpStatus)).append(' ')
+                    .append(Colors.highlight("%s", result.subdomain));
+        } else {
+            line.append(Colors.highlight("%s", result.subdomain))
+                    .append(" -> ").append(result.ip);
+        }
+        System.out.print("\r\u001b[K" + line + "\n");
+        System.out.flush();
+    }
+
+    /** 状态码着色：2xx 绿、3xx 黄、其余红（自 SubCommand 迁入，实时打印共用）。 */
+    private static String statusColor(int status) {
+        if (status >= 200 && status < 300) {
+            return Colors.success("%d", status);
+        }
+        if (status >= 300 && status < 400) {
+            return Colors.warning("%d", status);
+        }
+        return Colors.error("%d", status);
     }
 
     /**

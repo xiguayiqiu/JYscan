@@ -63,7 +63,7 @@
 - **信息收集工具**
   - `process`：进程与服务信息收集
   - `userinfo`：本地用户与组分析
-  - `sub`：子域名枚举（字典 + DNS；HTTP 存活验证默认开启，`--no-http` 关闭；DNS 优先系统 resolver、失败自动换源、回退 8.8.8.8）
+  - `sub`：子域名枚举（字典 + HTTP 存活验证默认开启、`--no-http` 关闭；命中实时逐行显示；DNS 优先系统 resolver、失败自动换源、回退 8.8.8.8）
   - `sitemap`：Sitemap 分析
 - **Web 安全工具**
   - `waf`：WAF 识别
