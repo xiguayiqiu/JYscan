@@ -591,7 +591,7 @@ public class Scanner {
             }
 
             // 显示所有扫描结果
-            displayResult(result);
+            displayResult(result, true);
 
             // 保存到文件
             BufferedWriter writer = outputFile;
@@ -652,29 +652,40 @@ public class Scanner {
     // displayResult 显示扫描结果
     // =====================================================================
 
-    private void displayResult(ScanResult result) {
+    /**
+     * 显示单条扫描结果。
+     *
+     * <p>与 Go 的差异（bug 修复）：上游用 {@code ESC[s} 保存光标 → 打印结果 →
+     * {@code ESC[u} 恢复光标 → {@code \r ESC[K} 清行重绘进度，恢复后的清行会把
+     * 刚打印的结果整行抹掉，终端上分组标题下只剩一行"扫描进度"，完全看不到
+     * 结果 URL。这里改为：实时路径先清进度行、打印完整结果行、再重绘进度；
+     * 汇总路径直接打印整行（扫描已结束，不再重绘进度）。
+     *
+     * @param result 扫描结果
+     * @param live   是否为扫描中的实时显示（需要在结果行后重绘进度条）
+     */
+    private void displayResult(ScanResult result, boolean live) {
         synchronized (this) {
             String statusColor = statusCodeColor(result.statusCode);
 
-            // 保存光标位置，显示结果，然后恢复光标位置
-            System.out.print("\u001b[s");
-
-            System.out.print(Fmt.format("[%s] %-8d %s",
+            StringBuilder line = new StringBuilder(Fmt.format("[%s] %-8d %s",
                     Colors.wrap(Fmt.format("%3d", result.statusCode), statusColor),
                     result.size,
                     result.url));
-
             if (result.title != null && !result.title.isEmpty()) {
-                System.out.print(Fmt.format(" - %s", result.title));
+                line.append(Fmt.format(" - %s", result.title));
             }
-            System.out.println();
 
-            // 恢复光标位置并显示进度
-            System.out.print("\u001b[u");
-            synchronized (mutex) {
-                double progress = (double) scannedCount / totalWords * 100;
-                System.out.print(Fmt.format("\r\u001b[K扫描进度: %d/%d (%.1f%%)",
-                        scannedCount, totalWords, progress));
+            if (live) {
+                // 先清掉当前进度行，打印结果行（带换行），再重绘进度
+                System.out.print("\r\u001b[K" + line + "\n");
+                synchronized (mutex) {
+                    double progress = (double) scannedCount / totalWords * 100;
+                    System.out.print(Fmt.format("\r\u001b[K扫描进度: %d/%d (%.1f%%)",
+                            scannedCount, totalWords, progress));
+                }
+            } else {
+                System.out.println(line);
             }
             System.out.flush();
         }
@@ -734,9 +745,9 @@ public class Scanner {
                     Fmt.format("=== 状态码 %d (%d 个路径) ===", statusCode, group.size()),
                     statusColor));
 
-            // 显示结果
+            // 显示结果（汇总阶段：扫描已结束，直接打印整行，不重绘进度）
             for (ScanResult result : group) {
-                displayResult(result);
+                displayResult(result, false);
             }
         }
         System.out.flush();
