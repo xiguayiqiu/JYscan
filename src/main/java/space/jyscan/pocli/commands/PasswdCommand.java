@@ -8,6 +8,8 @@ import space.jyscan.core.util.Colors;
 import space.jyscan.modules.weakpass.WeakpassClient;
 
 import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -15,39 +17,60 @@ import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.Callable;
 
 /**
- * passwd 命令（JYscan 原创）：通过 weakpass.com API 获取密码字典列表、下载字典。
+ * passwd 命令（JYscan 原创）：对接 weakpass.com API 全部13个端点 ——
+ * 字典列表/下载、哈希查询（search）、前缀检索（range）、规则变异生成（generate）。
  *
  * <p>freeclient 无对应命令（其 {@code internal/weakpass} 仅为爆破模块空壳注释），
- * 因此本命令按 JYscan 自身惯例设计；HTTP 层超时/停滞防护见 {@link WeakpassClient}。
+ * 本命令按 JYscan 自身惯例设计；HTTP 超时/停滞/回退策略见 {@link WeakpassClient}。
  */
 @Command(
         name = "passwd",
-        description = "密码字典获取工具 - weakpass 字典列表与下载",
+        description = "weakpass 密码字典与哈希工具 - 列表/下载/查询/检索/生成",
         synopsisHeading = "%n",
         sortOptions = false,
         mixinStandardHelpOptions = true,
         header = {
-                "通过 weakpass.com API 获取密码字典列表、下载密码字典。",
+                "对接 weakpass.com API 全部13个端点：字典列表/下载、哈希查询、前缀检索、规则变异生成。",
                 "",
                 "使用示例:",
-                "  ./JYscan passwd -l                        # 获取字典列表",
-                "  ./JYscan passwd -d rockyou.txt            # 下载指定字典到当前目录",
-                "  ./JYscan passwd -d ignis-10K.txt -o dicts # 下载到指定目录",
-                "  ./JYscan passwd -d a.txt,b.txt            # 逗号分隔批量下载",
-                "  ./JYscan passwd --all -o dicts            # 下载列表中的全部字典",
+                "  ./JYscan passwd -l                          # 字典列表 (GET /wordlists)",
+                "  ./JYscan passwd -d rockyou.txt -o dicts     # 下载字典 (GET /wordlists/{name})",
+                "  ./JYscan passwd -s e10adc3949ba59abbe56e057f20f883e   # 哈希查明文 (.txt)",
+                "  ./JYscan passwd -s <hash> --json            # 同上, JSON 输出 (.json 变体)",
+                "  ./JYscan passwd -r e10adc                   # 前缀检索 hash:pass (range .txt)",
+                "  ./JYscan passwd -r e10adc --filter pass --type ntlm   # 只要密码列/指定算法",
+                "  ./JYscan passwd -g admin -o out.txt         # 预设规则变异 (GET /generate/{s})",
+                "  ./JYscan passwd -g 'a/b'                    # 含斜杠自动改走 POST /generate",
+                "  ./JYscan passwd -g admin --rule-file r.rule # 上传规则文件 (POST /generate/file)",
+                "  ./JYscan passwd -g admin --rule-file - < r.rule       # stdin原始规则 (custom)",
                 "",
                 "参数说明:",
                 "  -l, --list\t\t获取密码字典列表",
                 "  -d, --download\t下载指定字典（逗号分隔可批量）",
                 "  -a, --all\t\t下载列表中的全部字典",
-                "  -o, --output\t\t下载目录（默认当前目录）",
+                "  -s, --search\t\t哈希查询明文（自动识别类型）",
+                "  -r, --range\t\t按哈希前缀检索 hash:pass 对",
+                "  -g, --generate\t按 hashcat 规则变异生成候选",
+                "  --set\t\t\tgenerate 预设规则集（默认 online.rule）",
+                "  --rule-file\t\t自定义规则文件（'-' = 标准输入）",
+                "  --type\t\t\trange 哈希类型: md5|ntlm|sha1|sha256（默认 md5）",
+                "  --filter\t\t\trange 输出列: hash|pass（默认 hash:pass 双列）",
+                "  --json\t\t\tsearch/range/generate 以 JSON 输出",
+                "  -o, --output\t\t下载模式=目录（默认当前目录）；查询/生成模式=输出文件（缺省走标准输出）",
                 "  --api\t\t\tAPI 基地址（默认 weakpass.com，可指向自建镜像）"
         }
 )
 public class PasswdCommand implements Callable<Integer> {
+
+    /** 服务端 range 端点的 type 枚举（OpenAPI 规范）。 */
+    private static final Set<String> RANGE_TYPES = Set.of("md5", "ntlm", "sha1", "sha256");
+
+    /** 服务端 range 端点的 filter 枚举（OpenAPI 规范）。 */
+    private static final Set<String> RANGE_FILTERS = Set.of("hash", "pass");
 
     @Option(names = {"-l", "--list"}, description = "获取密码字典列表")
     boolean list;
@@ -59,10 +82,42 @@ public class PasswdCommand implements Callable<Integer> {
     @Option(names = {"-a", "--all"}, description = "下载列表中的全部字典")
     boolean all;
 
-    @Option(names = {"-o", "--output"}, defaultValue = ".", description = "下载目录（默认当前目录）")
+    @Option(names = {"-s", "--search"}, paramLabel = "<hash>",
+            description = "哈希查询明文（自动识别类型）")
+    String search;
+
+    @Option(names = {"-r", "--range"}, paramLabel = "<prefix>",
+            description = "按哈希前缀检索 hash:pass 对")
+    String range;
+
+    @Option(names = {"-g", "--generate"}, paramLabel = "<string>",
+            description = "按 hashcat 规则变异生成候选")
+    String generate;
+
+    @Option(names = "--set", defaultValue = "online.rule",
+            description = "generate 预设规则集（默认 ${DEFAULT-VALUE}）")
+    String set;
+
+    @Option(names = "--rule-file", paramLabel = "<path>",
+            description = "自定义 hashcat 规则文件（'-' 表示从标准输入读取）")
+    String ruleFile;
+
+    @Option(names = "--type", defaultValue = "md5",
+            description = "range 哈希类型: md5|ntlm|sha1|sha256（默认 ${DEFAULT-VALUE}）")
+    String type;
+
+    @Option(names = "--filter",
+            description = "range 输出列: hash|pass（默认 hash:pass 双列）")
+    String filter;
+
+    @Option(names = "--json", description = "search/range/generate 以 JSON 输出")
+    boolean json;
+
+    @Option(names = {"-o", "--output"},
+            description = "下载模式=目录（默认当前目录）；查询/生成模式=输出文件（缺省走标准输出）")
     String output;
 
-    @Option(names = {"--api"}, defaultValue = WeakpassClient.DEFAULT_BASE_URL,
+    @Option(names = "--api", defaultValue = WeakpassClient.DEFAULT_BASE_URL,
             description = "API 基地址（默认 ${DEFAULT-VALUE}）")
     String api;
 
@@ -71,38 +126,103 @@ public class PasswdCommand implements Callable<Integer> {
 
     @Override
     public Integer call() {
-        if (!list && (download == null || download.isEmpty()) && !all) {
-            Colors.errorPrint("请指定 -l 获取字典列表，或 -d/--all 下载字典");
+        boolean downloads = all || (download != null && !download.isEmpty());
+        boolean queries = search != null || range != null || generate != null;
+
+        if (!list && !downloads && !queries) {
+            Colors.errorPrint("请指定 -l/-d/-a/-s/-r/-g 之一（-h 查看帮助）");
             spec.commandLine().usage(System.out);
+            return 1;
+        }
+        if (ruleFile != null && generate == null) {
+            Colors.errorPrint("--rule-file 需要配合 -g/--generate 使用");
+            return 1;
+        }
+        if (range != null && !RANGE_TYPES.contains(type)) {
+            Colors.errorPrint("--type 须为 md5|ntlm|sha1|sha256，收到: %v", type);
+            spec.commandLine().usage(System.out);
+            return 1;
+        }
+        if (filter != null && !RANGE_FILTERS.contains(filter)) {
+            Colors.errorPrint("--filter 须为 hash|pass，收到: %v", filter);
+            spec.commandLine().usage(System.out);
+            return 1;
+        }
+        if (output != null && queries && downloads) {
+            Colors.errorPrint("-o 在下载模式表示目录、在查询/生成模式表示文件，不可混用");
             return 1;
         }
 
         WeakpassClient client = new WeakpassClient(api);
         int failures = 0;
 
-        // ---- 列表 ----
         if (list) {
-            try {
-                List<String> names = client.list();
-                // 表头走 info（-q 可抑制），条目直出 stdout 便于管道
-                Colors.infoPrint("[+] 密码字典列表（来源 weakpass.com）: 共 %d 个", names.size());
-                for (String n : names) {
-                    System.out.println(n);
-                }
-            } catch (WeakpassClient.ApiException e) {
-                Colors.errorPrint("获取字典列表失败: HTTP %d: %v", e.status(), e.getMessage());
-                failures++;
-            } catch (IOException e) {
-                Colors.errorPrint("获取字典列表失败: %v", e.getMessage());
-                failures++;
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                Colors.errorPrint("获取字典列表被中断");
-                failures++;
-            }
+            failures += doList(client);
+        }
+        if (search != null) {
+            failures += doSearch(client);
+        }
+        if (range != null) {
+            failures += doRange(client);
+        }
+        if (generate != null) {
+            failures += doGenerate(client);
+        }
+        if (downloads) {
+            failures += doDownloads(client);
         }
 
-        // ---- 下载集：-d 展开 + -a 取全量（LinkedHashSet 去重且保序）----
+        return failures == 0 ? 0 : 1;
+    }
+
+    // ------------------------------------------------------------------
+    // 各动作
+    // ------------------------------------------------------------------
+
+    private int doList(WeakpassClient client) {
+        try {
+            List<String> names = client.list();
+            // 表头走 info（-q 可抑制），条目直出 stdout 便于管道
+            Colors.infoPrint("[+] 密码字典列表（来源 weakpass.com API）: 共 %d 个", names.size());
+            for (String n : names) {
+                System.out.println(n);
+            }
+            return 0;
+        } catch (WeakpassClient.ApiException e) {
+            Colors.errorPrint("%v", e.getMessage());
+            return 1;
+        } catch (IOException e) {
+            Colors.errorPrint("获取字典列表失败: %v", e.getMessage());
+            return 1;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            Colors.errorPrint("获取字典列表被中断");
+            return 1;
+        }
+    }
+
+    private int doSearch(WeakpassClient client) {
+        return withSink("[+] 查询结果 %d 字节 → %s", out -> {
+            byte[] body = client.search(search, json).getBytes(StandardCharsets.UTF_8);
+            out.write(body);
+            if (body.length == 0 || body[body.length - 1] != '\n') {
+                out.write('\n');
+            }
+            return body.length;
+        });
+    }
+
+    private int doRange(WeakpassClient client) {
+        return withSink("[+] 前缀检索完成: %d 字节 → %s",
+                out -> client.range(range, type, filter, json, out));
+    }
+
+    private int doGenerate(WeakpassClient client) {
+        return withSink("[+] 生成完成: %d 字节 → %s",
+                out -> client.generate(generate, set, ruleFile, json, out, System.in));
+    }
+
+    private int doDownloads(WeakpassClient client) {
         LinkedHashSet<String> names = new LinkedHashSet<>();
         if (download != null) {
             for (String d : download) {
@@ -111,11 +231,12 @@ public class PasswdCommand implements Callable<Integer> {
                 }
             }
         }
+        int failures = 0;
         if (all) {
             try {
                 names.addAll(client.list());
             } catch (WeakpassClient.ApiException e) {
-                Colors.errorPrint("获取字典列表失败: HTTP %d: %v", e.status(), e.getMessage());
+                Colors.errorPrint("获取字典列表失败: %v", e.getMessage());
                 failures++;
             } catch (IOException e) {
                 Colors.errorPrint("获取字典列表失败: %v", e.getMessage());
@@ -126,25 +247,19 @@ public class PasswdCommand implements Callable<Integer> {
                 failures++;
             }
         }
-
-        if (!names.isEmpty()) {
-            failures += downloadAll(client, names);
+        if (names.isEmpty()) {
+            return failures;
         }
 
-        return failures == 0 ? 0 : 1;
-    }
-
-    /** 逐个下载（顺序执行）；返回失败个数。 */
-    private int downloadAll(WeakpassClient client, LinkedHashSet<String> names) {
-        Path dir = Paths.get(output);
+        String dirName = output == null ? "." : output;
+        Path dir = Paths.get(dirName);
         try {
             Files.createDirectories(dir);
         } catch (IOException e) {
             Colors.errorPrint("创建目录失败: %v", e.getMessage());
-            return names.size();
+            return failures + names.size();
         }
 
-        int failures = 0;
         int done = 0;
         for (String name : names) {
             // 先校验名字（防 ../ 穿越出输出目录），再解析目标路径
@@ -169,12 +284,12 @@ public class PasswdCommand implements Callable<Integer> {
                 if (e.status() == 404) {
                     Colors.errorPrint("字典不存在: %s（用 -l 查看可用列表）", name);
                 } else {
-                    Colors.errorPrint("下载失败: %s: HTTP %d", name, e.status());
+                    Colors.errorPrint("%s: %v", name, e.getMessage());
                 }
                 deleteQuietly(target);
                 failures++;
             } catch (IOException e) {
-                Colors.errorPrint("下载失败: %s: %v", name, e.getMessage());
+                Colors.errorPrint("%s: %v", name, e.getMessage());
                 deleteQuietly(target);
                 failures++;
             } catch (InterruptedException e) {
@@ -188,6 +303,59 @@ public class PasswdCommand implements Callable<Integer> {
             Colors.infoPrint("[*] 本次成功下载 %d 个字典 → %s", done, dir);
         }
         return failures;
+    }
+
+    // ------------------------------------------------------------------
+    // 输出槽与工具
+    // ------------------------------------------------------------------
+
+    /** 可抛受检异常的动作（在输出槽内执行）。 */
+    @FunctionalInterface
+    private interface SinkRun {
+        long run(OutputStream out) throws IOException, InterruptedException;
+    }
+
+    /**
+     * 统一输出槽：{@code -o} 有值 → 写文件（完成后打摘要）；否则写标准输出
+     * （纯数据不打摘要，以免污染管道）。异常统一翻译成错误行 + 退出码 1。
+     */
+    private int withSink(String doneFmt, SinkRun action) {
+        boolean toFile = output != null;
+        OutputStream sink = System.out;
+        boolean opened = false;
+        try {
+            if (toFile) {
+                Path p = Paths.get(output);
+                if (p.getParent() != null) {
+                    Files.createDirectories(p.getParent());
+                }
+                sink = Files.newOutputStream(p);
+                opened = true;
+            }
+            long n = action.run(sink);
+            if (toFile) {
+                Colors.infoPrint(doneFmt, n, output);
+            }
+            return 0;
+        } catch (WeakpassClient.ApiException e) {
+            Colors.errorPrint("%v", e.getMessage());
+            return 1;
+        } catch (IOException e) {
+            Colors.errorPrint("%v", e.getMessage());
+            return 1;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            Colors.errorPrint("操作被中断");
+            return 1;
+        } finally {
+            if (opened) {
+                try {
+                    sink.close();
+                } catch (IOException ignored) {
+                    // 关闭失败不覆盖主结果
+                }
+            }
+        }
     }
 
     /** 失败/中断后清理半成品文件。 */

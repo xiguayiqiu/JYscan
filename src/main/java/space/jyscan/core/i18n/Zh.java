@@ -42,7 +42,7 @@ final class Zh {
         MESSAGES.put("cmd.linenum.short", "Linux本地信息枚举工具");
         MESSAGES.put("cmd.crunch.short", "计算机根据算法生成的密码字典生成工具");
         MESSAGES.put("cmd.cupp.short", "根据社会工程学信息生成密码-社会工程学密码生成器");
-        MESSAGES.put("cmd.passwd.short", "密码字典获取工具 - weakpass 字典列表与下载");
+        MESSAGES.put("cmd.passwd.short", "weakpass 密码字典与哈希工具 - 列表/下载/查询/检索/生成");
         MESSAGES.put("cmd.database.short", "数据库密码爆破工具");
         MESSAGES.put("cmd.dirscan.short", "网站目录扫描工具");
         MESSAGES.put("cmd.dns.short", "DNS 查询工具，支持多种记录类型和反向查询");

@@ -1,14 +1,18 @@
 package space.jyscan.modules.weakpass;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -23,11 +27,25 @@ import java.util.concurrent.atomic.AtomicLong;
  * weakpass.com 密码字典 API 客户端（JYscan 原创功能；freeclient 的
  * {@code internal/weakpass} 只是弱口令爆破模块的空壳注释，无 API 实现可移植）。
  *
- * <p>API 规范来自 {@code https://weakpass.com/openapi.json}（base: {@code /api/v1}）：
+ * <p>API 规范来自 {@code https://weakpass.com/openapi.json}（base: {@code /api/v1}），
+ * 全部13个路径均已对接（.json 与 base 实测字节一致，文本形态走 .txt 变体）：
  * <ul>
- *   <li>{@code GET {base}/wordlists} —— 纯文本换行分隔的字典名列表（如 rockyou.txt）；</li>
- *   <li>{@code GET {base}/wordlists/{name}} —— 字典内容（text/plain；404 = 不存在）。</li>
+ *   <li>{@code GET /wordlists} —— 纯文本换行分隔的字典名列表；</li>
+ *   <li>{@code GET /wordlists/{name}} —— 字典内容（404 = 不存在）；</li>
+ *   <li>{@code GET /search/{hash}[.txt|.json]} —— 哈希查明文（自动识别算法，
+ *       404 = 未命中）；</li>
+ *   <li>{@code GET /range/{prefix}[.txt|.json]} —— 按前缀检索 hash:pass 对
+ *       （{@code type=md5|ntlm|sha1|sha256}、{@code filter=hash|pass}；前缀不足
+ *       3 字符 → 500 {@code "Invalid prefix"}；.txt 默认 {@code hash:pass} 行）；</li>
+ *   <li>{@code GET /generate/{string}} / {@code POST /generate} —— 预设规则集变异
+ *       （{@code set=*.rule}、{@code type=txt|json}；string 含 '/' 无法入 path 时
+ *       自动回退 POST query 形式）；</li>
+ *   <li>{@code POST /generate/file[/{string}]} —— multipart 上传自定义规则文件；</li>
+ *   <li>{@code POST /generate/custom/{string]} —— raw text/plain 规则体
+ *       （本客户端从标准输入读取）。</li>
  * </ul>
+ * 服务端对 generate 的 string 统一限制不超过64字符（超限 500 +
+ * {@code string length should be less 64}，原样透传）。
  *
  * <p>超时设计（与 nuclei {@code HTTPExecutor} 卡死修复同一套思路，杜绝无界阻塞）：
  * <ul>
@@ -138,18 +156,139 @@ public final class WeakpassClient {
 
         int code = resp.statusCode();
         if (code != 200) {
+            String snippet;
             try (InputStream err = resp.body()) {
-                err.readAllBytes();
-            } catch (IOException ignored) {
-                // 读错误体仅为释放连接，失败无妨
+                snippet = new String(err.readAllBytes(), StandardCharsets.UTF_8);
+            } catch (IOException e) {
+                snippet = "";
             }
-            throw new ApiException(code, code == 404 ? "No data" : ("HTTP " + code));
+            throw statusException(code, snippet, "下载");
         }
 
         try (InputStream in = resp.body();
              OutputStream out = Files.newOutputStream(target)) {
             return copyWithIdleGuard(name, in, out);
         }
+    }
+
+    /**
+     * GET /search/{hash}[.txt|.json] → 查询结果文本（小载荷，全程限时）。
+     *
+     * <p>文本形态 {@code type;hash;pass}；JSON 形态 {@code {"type","hash","pass"}}。
+     * 404 = 库中无此哈希。
+     */
+    public String search(String hash, boolean json) throws IOException, InterruptedException {
+        if (hash == null || hash.isBlank()) {
+            throw new IOException("哈希不能为空");
+        }
+        HttpRequest req = requestBuilder(baseUrl + "/search/" + enc(hash) + (json ? ".json" : ".txt"))
+                .timeout(HEADER_TIMEOUT)
+                .GET()
+                .build();
+        HttpResponse<String> resp = sendString(req);
+        if (resp.statusCode() == 404) {
+            throw new ApiException(404, "未命中: 库中无此哈希 " + hash);
+        }
+        checkStatus(resp.statusCode(), resp.body(), "哈希查询");
+        return resp.body();
+    }
+
+    /**
+     * GET /range/{prefix}[.txt|.json]?type=&amp;filter= → 流式写 {@code out}，返回字节数。
+     *
+     * <p>.txt 默认 {@code hash:pass} 行，filter=pass/hash 裁成单列；json 为对象数组。
+     * 前缀不足 3 字符 → 500 {@code "Invalid prefix"}（以 ApiException 透传）。
+     */
+    public long range(String prefix, String type, String filter, boolean json, OutputStream out)
+            throws IOException, InterruptedException {
+        if (prefix == null || prefix.isBlank()) {
+            throw new IOException("前缀不能为空");
+        }
+        StringBuilder url = new StringBuilder(baseUrl)
+                .append("/range/").append(enc(prefix)).append(json ? ".json" : ".txt")
+                .append("?type=").append(q(type));
+        if (filter != null && !filter.isBlank()) {
+            url.append("&filter=").append(q(filter));
+        }
+        return streamTo(requestBuilder(url.toString()).GET().build(), "前缀检索",
+                "range " + prefix, out);
+    }
+
+    /**
+     * 字典生成（三种模式，响应均流式写出）：
+     * <ul>
+     *   <li>{@code ruleFile == null} —— 预设规则集：string 可安全入 path 走
+     *       {@code GET /generate/{string}?set=&type=}，否则（含 '/'）自动回退
+     *       {@code POST /generate?string=&set=&type=}；</li>
+     *   <li>{@code ruleFile == "-"} —— 规则从 {@code stdin} 读，走
+     *       {@code POST /generate/custom/{string}（raw text/plain body）}；</li>
+     *   <li>{@code ruleFile == <路径>} —— 规则文件 multipart 上传：string 可入 path 走
+     *       {@code /generate/file/{string}}，否则走 {@code /generate/file}
+     *       （string 进表单字段）。JDK 无内置 multipart API，boundary 由本类手拼。</li>
+     * </ul>
+     */
+    public long generate(String string, String set, String ruleFile, boolean json,
+                         OutputStream out, InputStream stdin)
+            throws IOException, InterruptedException {
+        if (string == null || string.isEmpty()) {
+            throw new IOException("生成字符串不能为空");
+        }
+        String type = json ? "json" : "txt";
+
+        if (ruleFile == null) {
+            HttpRequest req;
+            if (pathSafe(string)) {
+                req = requestBuilder(baseUrl + "/generate/" + enc(string)
+                        + "?set=" + q(set) + "&type=" + type).GET().build();
+            } else {
+                req = requestBuilder(baseUrl + "/generate?string=" + q(string)
+                        + "&set=" + q(set) + "&type=" + type)
+                        .POST(HttpRequest.BodyPublishers.noBody()).build();
+            }
+            return streamTo(req, "规则生成", "generate " + string, out);
+        }
+
+        if ("-".equals(ruleFile)) {
+            if (!pathSafe(string)) {
+                throw new IOException("字符串含 '/' 无法入 custom 端点路径（该端点无 query 变体），"
+                        + "请改用 --rule-file <文件>");
+            }
+            InputStream src = stdin == null ? InputStream.nullInputStream() : stdin;
+            HttpRequest req = requestBuilder(baseUrl + "/generate/custom/" + enc(string)
+                    + "?type=" + type)
+                    .header("Content-Type", "text/plain; charset=UTF-8")
+                    .POST(HttpRequest.BodyPublishers.ofInputStream(() -> src))
+                    .build();
+            return streamTo(req, "自定义规则生成", "generate custom " + string, out);
+        }
+
+        Path rf = Paths.get(ruleFile);
+        byte[] rules;
+        try {
+            rules = Files.readAllBytes(rf);
+        } catch (IOException e) {
+            throw new IOException("读取规则文件失败: " + ruleFile + ": " + e.getMessage(), e);
+        }
+        String filename = rf.getFileName().toString();
+        String boundary = "----JYscanWeakpass" + Long.toUnsignedString(System.nanoTime());
+        Part filePart = part("file", filename, "application/octet-stream", rules);
+        Part typePart = part("type", null, null, type.getBytes(StandardCharsets.UTF_8));
+        String url;
+        List<Part> parts;
+        if (pathSafe(string)) {
+            url = baseUrl + "/generate/file/" + enc(string);
+            parts = List.of(filePart, typePart);
+        } else {
+            url = baseUrl + "/generate/file";
+            parts = List.of(filePart,
+                    part("string", null, null, string.getBytes(StandardCharsets.UTF_8)),
+                    typePart);
+        }
+        HttpRequest req = requestBuilder(url)
+                .header("Content-Type", "multipart/form-data; boundary=" + boundary)
+                .POST(HttpRequest.BodyPublishers.ofByteArray(multipartBody(parts, boundary)))
+                .build();
+        return streamTo(req, "规则文件上传生成", "generate file " + string, out);
     }
 
     /** 字典名安全校验：拒绝空名、路径分隔符与 `..`（同时保护输出路径）。 */
@@ -186,16 +325,115 @@ public final class WeakpassClient {
         }
     }
 
-    private static void checkStatus(int code, String body, String what) throws ApiException {
-        if (code == 200) {
-            return;
+    /**
+     * 流式请求三段式：头阶段 {@link #sendStream} 有界（15s+2s 兜底，同样<b>不</b>设
+     * {@code HttpRequest.timeout}），非 2xx 读错误体成 {@link ApiException}，
+     * 200 的 body 过 {@link #copyWithIdleGuard} 写 {@code out}。
+     */
+    private long streamTo(HttpRequest req, String what, String nameForMsg, OutputStream out)
+            throws IOException, InterruptedException {
+        HttpResponse<InputStream> resp = sendStream(req);
+        int code = resp.statusCode();
+        if (code != 200) {
+            String snippet;
+            try (InputStream err = resp.body()) {
+                snippet = new String(err.readAllBytes(), StandardCharsets.UTF_8);
+            } catch (IOException e) {
+                snippet = "";
+            }
+            throw statusException(code, snippet, what);
         }
+        try (InputStream in = resp.body()) {
+            return copyWithIdleGuard(nameForMsg, in, out);
+        }
+    }
+
+    /** 头阶段有界的流式响应获取（body 留给 streamTo 消费）。 */
+    private HttpResponse<InputStream> sendStream(HttpRequest req)
+            throws IOException, InterruptedException {
+        CompletableFuture<HttpResponse<InputStream>> pending =
+                client.sendAsync(req, HttpResponse.BodyHandlers.ofInputStream());
+        try {
+            return pending.get(HEADER_TIMEOUT.toNanos() + BACKSTOP_NANOS, TimeUnit.NANOSECONDS);
+        } catch (TimeoutException e) {
+            pending.cancel(true);
+            throw new IOException("请求超时(15s): " + req.uri(), e);
+        } catch (ExecutionException e) {
+            throw unwrap(e);
+        }
+    }
+
+    private static ApiException statusException(int code, String body, String what) {
         String snippet = body == null ? "" : body.strip();
         if (snippet.length() > 120) {
             snippet = snippet.substring(0, 120) + "...";
         }
-        throw new ApiException(code, what + "失败: HTTP " + code
+        return new ApiException(code, what + "失败: HTTP " + code
                 + (snippet.isEmpty() ? "" : " " + snippet));
+    }
+
+    private static void checkStatus(int code, String body, String what) throws ApiException {
+        if (code == 200) {
+            return;
+        }
+        throw statusException(code, body, what);
+    }
+
+    // ---- multipart（JDK 无内置 API，手拼 boundary） ----
+
+    private record Part(String name, String filename, String contentType, byte[] content) {
+    }
+
+    private static Part part(String name, String filename, String contentType, byte[] content) {
+        return new Part(name, filename, contentType, content);
+    }
+
+    private static byte[] multipartBody(List<Part> parts, String boundary) {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        byte[] crlf = "\r\n".getBytes(StandardCharsets.US_ASCII);
+        for (Part p : parts) {
+            bos.write(("--" + boundary).getBytes(StandardCharsets.US_ASCII), 0,
+                    ("--" + boundary).length());
+            bos.write(crlf, 0, crlf.length);
+            StringBuilder disp = new StringBuilder("Content-Disposition: form-data; name=\"")
+                    .append(p.name()).append('"');
+            if (p.filename() != null) {
+                disp.append("; filename=\"").append(p.filename().replace("\"", "")).append('"');
+            }
+            byte[] d = disp.toString().getBytes(StandardCharsets.US_ASCII);
+            bos.write(d, 0, d.length);
+            bos.write(crlf, 0, crlf.length);
+            if (p.contentType() != null) {
+                byte[] ct = ("Content-Type: " + p.contentType())
+                        .getBytes(StandardCharsets.US_ASCII);
+                bos.write(ct, 0, ct.length);
+                bos.write(crlf, 0, crlf.length);
+            }
+            bos.write(crlf, 0, crlf.length);
+            bos.write(p.content(), 0, p.content().length);
+            bos.write(crlf, 0, crlf.length);
+        }
+        byte[] tail = ("--" + boundary + "--").getBytes(StandardCharsets.US_ASCII);
+        bos.write(tail, 0, tail.length);
+        bos.write(crlf, 0, crlf.length);
+        return bos.toByteArray();
+    }
+
+    // ---- URL 编码与路径安全 ----
+
+    /** path 段百分号编码（空格→%20；'/' 由 {@link #pathSafe} 排除，%2F 服务端会 302）。 */
+    private static String enc(String s) {
+        return URLEncoder.encode(s, StandardCharsets.UTF_8).replace("+", "%20");
+    }
+
+    /** query 值表单编码（空格→+ 在 query 中合法）。 */
+    private static String q(String s) {
+        return URLEncoder.encode(s, StandardCharsets.UTF_8);
+    }
+
+    /** string 能否安全入 URL path：服务端对 %2F 返回 302，故 '/' 一律排除。 */
+    private static boolean pathSafe(String s) {
+        return s.indexOf('/') < 0;
     }
 
     private static IOException unwrap(ExecutionException e) {
