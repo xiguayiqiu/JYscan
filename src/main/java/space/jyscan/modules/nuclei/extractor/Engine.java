@@ -89,9 +89,12 @@ public class Engine {
     /**
      * 正则提取，对应 Go 的 {@code (e *Engine) extractRegex}。
      *
-     * <p>nuclei 官方行为: 正则默认 case-insensitive（Go regexp 用 {@code (?i)} flag，
-     * nuclei 的 {@code case-insensitive: true} 是默认值，即便用户没显式声明）；
-     * named groups 优先，未命名组以十进制组号为键；{@code group:} 指定组优先提取。
+     * <p>named groups 优先，未命名组以十进制组号为键；{@code group:} 指定组优先提取。
+     *
+     * <p><b>nuclei-dev 对齐(误报修复)：</b>正则按原样编译（<b>区分大小写</b> ——
+     * nuclei 编译提取器正则不加 {@code (?i)}，{@code case-insensitive} 仅允许用于 kval）。
+     * freeclient 无条件前置 {@code (?i)}，会在官方提不出值的响应上产出提取值，
+     * 叠加无 matcher 发射门后构成误报，故此处不加（对 freeclient 的有意偏差）。
      */
     Map<String, String> extractRegex(Extractor ex, String target) {
         Map<String, String> result = new LinkedHashMap<>();
@@ -101,7 +104,7 @@ public class Engine {
         for (String p : ex.regex) {
             java.util.regex.Pattern re;
             try {
-                re = java.util.regex.Pattern.compile("(?i)" + p);
+                re = java.util.regex.Pattern.compile(p);
             } catch (java.util.regex.PatternSyntaxException e) {
                 // 对应 Go: regexp.Compile err → continue（含 (?P<name> 等 Go/Java 语法差异导致的编译失败）
                 continue;
@@ -114,7 +117,7 @@ public class Engine {
             int groupCount = matcher.groupCount();
             // nuclei 行为: named groups 优先（对应 Go: if re.NumSubexp() > 0 循环全组）
             if (groupCount > 0) {
-                String[] names = subexpNames("(?i)" + p);
+                String[] names = subexpNames(p);
                 for (int i = 1; i <= groupCount; i++) {
                     // 对应 Go: key = name，name 为空时 key = strconv.Itoa(i)
                     String name = i < names.length ? names[i] : "";
@@ -128,7 +131,7 @@ public class Engine {
             }
             // group: 提取指定组
             if (ex.group != null && !ex.group.isEmpty()) {
-                int groupIdx = subexpIndex("(?i)" + p, ex.group);
+                int groupIdx = subexpIndex(p, ex.group);
                 // 对应 Go: groupIdx > 0 && groupIdx < len(matches)
                 if (groupIdx > 0 && groupIdx <= groupCount) {
                     String g = matcher.group(groupIdx);

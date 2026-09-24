@@ -29,6 +29,7 @@ import space.jyscan.modules.nuclei.loader.Loader;
 import space.jyscan.modules.nuclei.model.Classification;
 import space.jyscan.modules.nuclei.model.DNSRequest;
 import space.jyscan.modules.nuclei.model.HTTPRequest;
+import space.jyscan.modules.nuclei.model.Matcher;
 import space.jyscan.modules.nuclei.model.Options;
 import space.jyscan.modules.nuclei.model.ResultEvent;
 import space.jyscan.modules.nuclei.model.SSLRequest;
@@ -303,7 +304,10 @@ public class Runner {
         if (t.flow != null && !t.flow.isEmpty() && httpReqs != null && !httpReqs.isEmpty()) {
             Object[] flow = executeFlow(t, target, baseVars);
             boolean flowMatched = Boolean.TRUE.equals(flow[0]);
-            if (flowMatched) {
+            FlowExecutor flowExec = (FlowExecutor) flow[4];
+            // nuclei-dev 对齐(误报修复): 除 flowMatched 外，还须存在「按 nuclei 语义会产生
+            // 事件」的步骤（有 matcher 命中，或无 matcher 的步骤提取出非 internal 值）
+            if (flowMatched && flowExec != null && flowExec.anyEventQualified()) {
                 // flow 执行成功: 提取最后一个请求的结果
                 String flowMatcherName = (String) flow[1];
                 @SuppressWarnings("unchecked")
@@ -349,9 +353,12 @@ public class Runner {
                     }
                     if (matched) {
                         Map<String, String> extracted = engine.extract(req.extractors, result);
-                        ResultEvent event = makeResultEvent(t, target, result, matched, extracted);
-                        event.matcherName = matcherName;
-                        emitResult(event, callback);
+                        // nuclei-dev 对齐(误报修复): 无 matchers 的请求须提取出非 internal 值才发结果
+                        if (emitsEvent(req.matchers, extracted)) {
+                            ResultEvent event = makeResultEvent(t, target, result, matched, extracted);
+                            event.matcherName = matcherName;
+                            emitResult(event, callback);
+                        }
                     }
                 }
             }
@@ -366,14 +373,34 @@ public class Runner {
                     String matcherName = (String) pm[1];
                     if (matched) {
                         Map<String, String> extracted = engine.extract(req.extractors, result);
-                        ResultEvent event = makeResultEvent(t, target, result, matched, extracted);
-                        event.matcherName = matcherName;
-                        emitResult(event, callback);
+                        // nuclei-dev 对齐(误报修复): 无 matchers 的请求须提取出非 internal 值才发结果
+                        if (emitsEvent(req.matchers, extracted)) {
+                            ResultEvent event = makeResultEvent(t, target, result, matched, extracted);
+                            event.matcherName = matcherName;
+                            emitResult(event, callback);
+                        }
                     }
                 }
             }
         }
         // Go-parity: ExecuteWithCallback 不含 TCP/SSL 分支，也不合并模板变量、不喂 progress/hostErrors —— 照抄
+    }
+
+    /**
+     * 一次请求是否应生成结果事件（nuclei-dev 对齐，误报修复）。
+     *
+     * <p>对应 nuclei {@code operators.Execute} 的发射门与
+     * {@code MakeDefaultResultEvent}：有 matchers 的请求以命中为准（调用方已处在
+     * {@code matched} 分支）；<b>无 matchers 的请求只有产出了非 internal 提取值
+     * 才生成事件</b>。freeclient/Java 原先空 matchers 直接判命中并无条件发射，
+     * 使「仅提取器模板」对每个响应都报结果（官方模板库 206 个 http/dns 仅提取器模板
+     * 全部沦为误报）。
+     */
+    static boolean emitsEvent(List<Matcher> matchers, Map<String, String> extracted) {
+        if (matchers != null && !matchers.isEmpty()) {
+            return true;
+        }
+        return extracted != null && !extracted.isEmpty();
     }
 
     /**
@@ -931,14 +958,17 @@ public class Runner {
         String matcherName = (String) pm[1];
         if (matched) {
             Map<String, String> extracted = engine.extract(req.extractors, result);
-            progress.incrementMatched();
+            // nuclei-dev 对齐(误报修复): 无 matchers 的请求须提取出非 internal 值才发结果
+            if (emitsEvent(req.matchers, extracted)) {
+                progress.incrementMatched();
 
-            ResultEvent event = makeResultEvent(t, target, result, matched, extracted);
-            event.matcherName = matcherName;
-            publishResult(event);
+                ResultEvent event = makeResultEvent(t, target, result, matched, extracted);
+                event.matcherName = matcherName;
+                publishResult(event);
 
-            if (t.stopAtFirstMatch) {
-                return null; // Go 照抄：返回 nil 并不中止外层请求循环（Go 侧无效分支）
+                if (t.stopAtFirstMatch) {
+                    return null; // Go 照抄：返回 nil 并不中止外层请求循环（Go 侧无效分支）
+                }
             }
         }
 
@@ -966,11 +996,14 @@ public class Runner {
         String matcherName = (String) pm[1];
         if (matched) {
             Map<String, String> extracted = engine.extract(req.extractors, result);
-            progress.incrementMatched();
+            // nuclei-dev 对齐(误报修复): 无 matchers 的请求须提取出非 internal 值才发结果
+            if (emitsEvent(req.matchers, extracted)) {
+                progress.incrementMatched();
 
-            ResultEvent event = makeResultEvent(t, target, result, matched, extracted);
-            event.matcherName = matcherName;
-            publishResult(event);
+                ResultEvent event = makeResultEvent(t, target, result, matched, extracted);
+                event.matcherName = matcherName;
+                publishResult(event);
+            }
         }
 
         return null;
@@ -996,11 +1029,14 @@ public class Runner {
         String matcherName = (String) pm[1];
         if (matched) {
             Map<String, String> extracted = engine.extract(req.extractors, result);
-            progress.incrementMatched();
+            // nuclei-dev 对齐(误报修复): 无 matchers 的请求须提取出非 internal 值才发结果
+            if (emitsEvent(req.matchers, extracted)) {
+                progress.incrementMatched();
 
-            ResultEvent event = makeResultEvent(t, target, result, matched, extracted);
-            event.matcherName = matcherName;
-            publishResult(event);
+                ResultEvent event = makeResultEvent(t, target, result, matched, extracted);
+                event.matcherName = matcherName;
+                publishResult(event);
+            }
         }
 
         return null;
@@ -1026,11 +1062,14 @@ public class Runner {
         String matcherName = (String) pm[1];
         if (matched) {
             Map<String, String> extracted = engine.extract(req.extractors, result);
-            progress.incrementMatched();
+            // nuclei-dev 对齐(误报修复): 无 matchers 的请求须提取出非 internal 值才发结果
+            if (emitsEvent(req.matchers, extracted)) {
+                progress.incrementMatched();
 
-            ResultEvent event = makeResultEvent(t, target, result, matched, extracted);
-            event.matcherName = matcherName;
-            publishResult(event);
+                ResultEvent event = makeResultEvent(t, target, result, matched, extracted);
+                event.matcherName = matcherName;
+                publishResult(event);
+            }
         }
 
         return null;
@@ -1155,11 +1194,12 @@ public class Runner {
      * (bool, string, map[string]string, map[string]interface{})}（{@code flow.go:399}）：
      * 无 flow / 解析失败（verbose 时打印）均返回空结果，否则交给 {@link FlowExecutor} 执行。
      *
-     * @return {@code Object[]{Boolean, String, Map<String,String>, Map<String,Object>}}
+     * @return {@code Object[]{Boolean, String, Map<String,String>, Map<String,Object>, FlowExecutor}}
+     *         第五位是执行器实例（nuclei-dev 对齐：供调用方做发射门判定），失败路径为 {@code null}
      */
     Object[] executeFlow(Template t, String target, Map<String, Object> baseVars) {
         if (t.flow == null || t.flow.isEmpty()) {
-            return new Object[]{Boolean.FALSE, "", null, null};
+            return new Object[]{Boolean.FALSE, "", null, null, null};
         }
 
         FlowNode node;
@@ -1169,11 +1209,12 @@ public class Runner {
             if (verbose) {
                 System.err.printf("[VERB] [FLOW] 解析 flow \"%s\" 失败: %s%n", t.flow, e.getMessage());
             }
-            return new Object[]{Boolean.FALSE, "", null, null};
+            return new Object[]{Boolean.FALSE, "", null, null, null};
         }
 
         FlowExecutor executor = new FlowExecutor(this, t, target, baseVars);
-        return executor.execute(node);
+        Object[] r = executor.execute(node);
+        return new Object[]{r[0], r[1], r[2], r[3], executor};
     }
 
     /**

@@ -3,3 +3,5 @@ target/
 *.class
 freeclient/
 README-GYscan.md
+nuclei.zip
+nuclei-dev/

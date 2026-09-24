@@ -16,10 +16,10 @@ import space.jyscan.modules.nuclei.protocol.ProtocolResult;
  * <p>执行语义与 Go 逐条对应：按请求编号缓存执行结果（同一 {@code http(n)} 只真正执行一次）、
  * {@code &&} 要求两侧都命中并合并提取数据与 data、{@code ||} 取左侧命中否则取右侧。
  *
- * <p><b>Go-parity 说明：</b>{@code executeBinary} 的 {@code ||} 分支在 Go 中不检查
- * {@code rightMatched}——左侧未命中时<b>无条件返回 true</b>（{@code flow.go:350-356}，
- * 注释写的是「任意一侧匹配即可」但实现漏了右侧判断）。此处按「Go-parity 优先」原样复刻，
- * 并在报告中列为 Go 侧缺陷。
+ * <p><b>nuclei-dev 对齐(误报修复)：</b>{@code executeBinary} 的 {@code ||} 分支在 Go 中
+ * 不检查 {@code rightMatched}——左侧未命中时<b>无条件返回 true</b>（{@code flow.go:350-356}，
+ * 注释写「任意一侧匹配即可」但漏判右侧），会使两侧皆失败的 flow 仍走最终发射（误报）。
+ * 此处按「任一侧实际命中」修正，为对 freeclient 的<b>有意偏差</b>。
  *
  * <p>Go 的四元返回 {@code (bool, string, map, map)} 在 Java 中映射为
  * {@code Object[]{Boolean, String, Map<String,String>, Map<String,Object>}}，
@@ -37,6 +37,8 @@ class FlowExecResult {
     String protocol = "";
     /** 对应 Go 的 {@code matched bool}。 */
     boolean matched;
+    /** 请求是否配置了 matchers（nuclei 发射/步骤判定用，Go 侧无此字段）。 */
+    boolean hasMatchers;
     /** 对应 Go 的 {@code matcherName string}。 */
     String matcherName = "";
     /** 对应 Go 的 {@code extracted map[string]string}。 */
@@ -107,6 +109,7 @@ class FlowExecutor {
         }
 
         boolean matched = false;
+        boolean stepHasMatchers = false;
         String matcherName = "";
         Map<String, String> extracted = null;
         Map<String, Object> data = null;
@@ -153,8 +156,20 @@ class FlowExecutor {
                         result.data, template.info);
                 matched = Boolean.TRUE.equals(pm[0]);
                 matcherName = (String) pm[1];
+                stepHasMatchers = httpReq.matchers != null && !httpReq.matchers.isEmpty();
                 if (matched) {
                     extracted = runner.engine.extract(httpReq.extractors, result);
+                    // nuclei-dev 对齐(误报修复): 无 matchers 但配置了 extractors 的步骤，
+                    // 必须提取出非 internal 值才算成功（flow_internal.go:114-142: 无
+                    // operator result 即步骤失败）；既无 matchers 又无 extractors 的步骤
+                    // 保持成功（flow_internal.go:137 hasOperators 分支）。freeclient 空
+                    // matchers 恒 true，会使提取失败的步骤放行后续步骤并最终发射 → 误报。
+                    if (!stepHasMatchers && httpReq.extractors != null && !httpReq.extractors.isEmpty()
+                            && (extracted == null || extracted.isEmpty())) {
+                        matched = false;
+                        matcherName = "";
+                        extracted = null;
+                    }
                 }
                 data = result.data;
                 break;
@@ -173,6 +188,7 @@ class FlowExecutor {
         stored.requestIndex = req.index;
         stored.protocol = req.protocol == null ? "" : req.protocol;
         stored.matched = matched;
+        stored.hasMatchers = stepHasMatchers;
         stored.matcherName = matcherName;
         stored.extracted = extracted;
         stored.data = data;
@@ -185,8 +201,8 @@ class FlowExecutor {
      *
      * <p>对应 Go 的 {@code (fe *flowExecutor) executeBinary(expr *flowBinaryExpr) (...)}。
      * {@code &&}：两侧都命中才命中，合并提取与 data，matcher 名取右侧；
-     * {@code ||}：<b>照抄 Go 的缺陷实现</b>——左侧命中取左侧，否则无条件返回
-     * {@code true} + 右侧结果（不检查右侧是否命中）。
+     * {@code ||}：<b>nuclei-dev 对齐</b>——左侧命中取左侧，否则取右侧，右侧也未命中则
+     * 返回 false（Go 无条件返回 true 是缺陷，不复刻，见类注释）。
      */
     @SuppressWarnings("unchecked") // Object[] 四元组的元素还原为 Map 泛型（与 Go 的具名多返回值一一对应）
     Object[] executeBinary(FlowBinaryExpr expr) {
@@ -212,15 +228,42 @@ class FlowExecutor {
                 }
                 return new Object[]{Boolean.FALSE, "", null, null};
             case OR:
-                // ||: Go-parity —— 左侧命中取左侧；否则无条件返回 true + 右侧
-                // （Go 未检查 rightMatched，见类注释与 flow.go:350-356）
+                // ||: 任一侧命中即命中（左侧优先）。
+                // nuclei-dev 对齐(误报修复): Go 未检查 rightMatched —— 左侧失败即无条件
+                // 返回 true，两侧皆失败时 flowMatched 仍为 true → 最终发射误报；
+                // 此处要求被采纳的一侧确实命中（见类注释）。
                 if (leftMatched) {
                     return new Object[]{Boolean.TRUE, leftName, leftExtracted, leftData};
                 }
-                return new Object[]{Boolean.TRUE, rightName, rightExtracted, rightData};
+                if (rightMatched) {
+                    return new Object[]{Boolean.TRUE, rightName, rightExtracted, rightData};
+                }
+                return new Object[]{Boolean.FALSE, "", null, null};
             default:
                 return new Object[]{Boolean.FALSE, "", null, null};
         }
+    }
+
+    /**
+     * flow 中是否存在「按 nuclei 语义会产生结果事件」的步骤（nuclei-dev 对齐）：
+     * 有 matchers 的步骤命中，或无 matchers 的步骤产出了非 internal 提取值
+     * （对应 {@code flow_internal.go:114-142} 的 operator result 判定与
+     * {@code operators.Execute} 的发射门）。Runner 发射 flow 最终事件前检查；
+     * freeclient 仅凭 flowMatched 即发射 → 误报。
+     */
+    boolean anyEventQualified() {
+        for (FlowExecResult r : results.values()) {
+            if (r == null || !r.matched) {
+                continue;
+            }
+            if (r.hasMatchers) {
+                return true;
+            }
+            if (r.extracted != null && !r.extracted.isEmpty()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

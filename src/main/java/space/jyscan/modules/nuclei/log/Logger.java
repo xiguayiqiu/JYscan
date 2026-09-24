@@ -32,9 +32,9 @@ import space.jyscan.core.util.Fmt;
  *       {@code no == true} 时 {@code Colors.setColor(false)}（Go：{@code color.NoColor = true}），
  *       {@code no == false} 时按 Go 不回写全局（Go 的 SetNoColor(false) 同样不复位
  *       {@code color.NoColor}）；</li>
- *   <li>着色统一走 {@link Colors#wrap(String, String...)}（按 {@link Colors#useColor}
- *       全局色标渲染，等价于 fatih/color 的 {@code Color.Sprint} 在调用时读
- *       {@code color.NoColor}），颜色码取 {@link Colors} 的 ANSI 常量，不引第三方库。</li>
+ *   <li>着色统一走 {@link Colors#wrapPrintln}（按 {@link Colors#useColor} 全局色标渲染，
+ *       unformat 按每个参数查 mapResetAttributes —— 与 fatih/color 的 {@code Color.Sprint}
+ *       所用 {@code wrap()} 原语一致），颜色码取 {@link Colors} 的 ANSI 常量，不引第三方库。</li>
  * </ul>
  *
  * <p><b>{@code Fatal} 的处理：</b>Go 的 {@code Fatal} 打印 {@code [FAT]} 后
@@ -44,6 +44,13 @@ import space.jyscan.core.util.Fmt;
  *
  * <p>格式化走 {@link Fmt#format}（Go {@code fmt.Sprintf} 兼容层）；线程安全对应 Go 的
  * {@code sync.Mutex}（{@code synchronized (mu)}）。
+ *
+ * <p><b>着色原语（fatih/color v1.18.0 源码实测）：</b>Go 侧前缀着色用
+ * {@code c.Sprint(prefix)} → fatih {@code wrap()} → per-param unformat
+ * （青+粗的 {@code [INF]} 复位为 {@code ESC[0;22m}）；而 {@code Print/Printf} 走
+ * {@code Set/Unset} 才输出通用 {@code ESC[0m}（Java 侧对应 {@link Colors#wrap}）。
+ * Logger 的两处着色点（{@code write()}、{@code infoTimestamped()}）均须走
+ * {@link Colors#wrapPrintln}，误用 {@link Colors#wrap} 会使复位序列与 Go 不一致。
  *
  * <p><b>i18n 说明：</b>Go 的 {@code nuclei.go} 引用了 14 个未在 i18n 中定义的 key
  * （如 {@code nuclei.err.no-target}），Go 的 {@code i18n.T} 缺 key 时原样返回 key，
@@ -184,7 +191,7 @@ public class Logger {
             if (noColor) {
                 out.print(ts + " [INF] " + msg + "\n");
             } else {
-                out.print(Colors.wrap(ts, GRAY) + " " + Colors.wrap("[INF]", CYAN) + " " + msg + "\n");
+                out.print(Colors.wrapPrintln(ts, GRAY) + " " + Colors.wrapPrintln("[INF]", CYAN) + " " + msg + "\n");
             }
         }
     }
@@ -193,14 +200,15 @@ public class Logger {
      * 实际写日志，对应 Go 的
      * {@code (l *Logger) write(prefix string, c *color.Color, format string, args ...interface{})}。
      *
-     * <p>{@code noColor} 为 true 输出纯文本；否则经 {@link Colors#wrap} 着色
-     * （等价 Go 的 {@code c.Sprint(prefix)} 在调用时读全局 {@code color.NoColor}）。
-     * 输出格式与 Go 一致：{@code "<prefix> <message>\n"}。
+     * <p>{@code noColor} 为 true 输出纯文本；否则经 {@link Colors#wrapPrintln} 着色 ——
+     * 等价 Go 的 {@code c.Sprint(prefix)}：fatih {@code wrap()} 原语在调用时读全局
+     * {@code color.NoColor}，unformat 按<b>每个参数</b>查 {@code mapResetAttributes}
+     * （如青+粗 → {@code ESC[0;22m}）。输出格式与 Go 一致：{@code "<prefix> <message>\n"}。
      */
     private void write(String prefix, String[] codes, String format, Object... args) {
         synchronized (mu) {
             String msg = Fmt.format(format, args);
-            String p = noColor ? prefix : Colors.wrap(prefix, codes);
+            String p = noColor ? prefix : Colors.wrapPrintln(prefix, codes);
             out.print(p + " " + msg + "\n");
         }
     }

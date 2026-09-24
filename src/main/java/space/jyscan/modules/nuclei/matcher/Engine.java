@@ -263,15 +263,15 @@ public class Engine {
     }
 
     /**
-     * nuclei 官方 MatchDSL 逻辑：表达式求值出错即视为不命中。
+     * MatchDSL：表达式求值出错即视为不命中；返回值<b>必须是 bool</b>。
      *
-     * <p>对应 Go 的 {@code (e *Engine) matchDSL(m *model.Matcher, data map[string]interface{}) *MatchResult}。
+     * <p>对应 Go 的 {@code (e *Engine) matchDSL(...)}；<b>判定以 nuclei-dev 为准</b>
+     * （{@code matchers/match.go:226-228}：非 bool 记录错误并 {@code continue}，
+     * AND/OR 下均跳过该表达式；只有 bool false 才走 AND 失败 / OR 跳过）。
      *
-     * <p>值→命中的判定逐条对应 Go 的类型断言：{@code bool} 真值；{@code string} 非空且非
-     * {@code "false"}/{@code "0"}；{@code float64}（reflect Kind == Float64）非 0。
-     * Go 对 {@code int} 等其它类型一律判不命中（reflect Kind 非 Float64），Java 侧同理
-     * 只认 {@link Double} —— dsl.Evaluator 的数值返回类型以 Go eval.go 为准
-     * （整型字面量 → int，浮点/算术 → float64）。
+     * <p><b>nuclei-dev 对齐(误报修复)：</b>freeclient 对非 bool 做了真值判定
+     * （string 非空且非 "false"/"0"、float64 非 0 → 命中），会把 {@code dsl: [hostname]}
+     * 这类返回字符串/数值的表达式误判为命中 → 误报；nuclei 官方对非 bool 一律不命中。
      */
     MatchResult matchDSL(Matcher m, Map<String, Object> data) {
         MatchResult result = new MatchResult();
@@ -298,18 +298,13 @@ public class Engine {
                     continue;
                 }
 
-                boolean matched = false;
-                if (val instanceof Boolean b && b) {
-                    matched = true;
-                } else if (val instanceof String s && !s.isEmpty()
-                        && !s.equals("false") && !s.equals("0")) {
-                    matched = true;
-                } else if (val instanceof Double d && d != 0.0) {
-                    // Go: reflect.ValueOf(val).Kind() == reflect.Float64 && val.(float64) != 0
-                    matched = true;
+                // nuclei-dev 对齐(误报修复): 返回值必须是 bool —— 非 bool 一律跳过该
+                // 表达式（AND/OR 均 continue，match.go:226-228）；bool false 才按
+                // AND 失败 / OR 跳过处理。
+                if (!(val instanceof Boolean b)) {
+                    continue;
                 }
-
-                if (!matched) {
+                if (!b) {
                     if (cond == MatcherCondition.AND) {
                         return new MatchResult();
                     }

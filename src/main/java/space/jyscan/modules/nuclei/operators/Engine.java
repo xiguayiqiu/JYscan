@@ -384,6 +384,11 @@ public class Engine {
      * <p>每个 extractor 先按 part 取目标串（body/all/"" → {@code result.Raw}，
      * status → 去空格的状态码，其余从 {@code result.Data} 取），再交给子引擎；
      * 提取值 {@code TrimSpace} 后为空的丢弃（nuclei 官方: 空提取值不加入结果）。
+     *
+     * <p><b>nuclei-dev 对齐(误报修复)：</b>{@code internal: true} 的提取器被整体跳过 ——
+     * 其值在 nuclei 中只进入 {@code DynamicValues}、不进入结果输出（{@code operators.Execute}
+     * 仅非 internal 计入 {@code Extracts/OutputExtracts}）；freeclient 未区分 internal，
+     * 其值会并入输出并被「无 matcher 发射门」放行 → 误报。
      */
     public Map<String, String> extract(List<Extractor> extractors, ProtocolResult result) {
         if (extractors == null || extractors.isEmpty()) {
@@ -395,6 +400,13 @@ public class Engine {
         Map<String, Object> data = result.data == null ? Map.of() : result.data;
 
         for (Extractor ex : extractors) {
+            // nuclei-dev 对齐(误报修复): internal 提取器只产出 dynamic values，不进入
+            // 结果输出（nuclei operators.Execute: internal → DynamicValues，仅非 internal
+            // 计入 Extracts/OutputExtracts）。freeclient 未区分 internal，其值会并入输出、
+            // 并被「无 matcher 发射门」放行 → 误报，此处按 nuclei 语义过滤。
+            if (ex.internal) {
+                continue;
+            }
             String target = "";
             String part = ex.getPart();
             switch (part) {
