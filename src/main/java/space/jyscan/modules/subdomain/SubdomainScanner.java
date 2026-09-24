@@ -11,6 +11,7 @@ import org.xbill.DNS.SimpleResolver;
 import org.xbill.DNS.Type;
 import space.jyscan.core.util.Colors;
 import space.jyscan.core.util.Fmt;
+import space.jyscan.core.util.TextFiles;
 
 import java.io.IOException;
 import java.net.URI;
@@ -128,7 +129,8 @@ public final class SubdomainScanner {
                 throw new IOException("无法打开字典文件: " + config.wordlist);
             }
             try {
-                lines = Files.readAllLines(file, StandardCharsets.UTF_8);
+                // 宽容解码：非 UTF-8 字典（GBK/Latin-1 等）不再抛 MalformedInputException
+                lines = TextFiles.readLines(file);
             } catch (IOException e) {
                 // Go: scanner.Err() → "读取字典文件错误: %v"
                 throw new IOException(Fmt.format("读取字典文件错误: %v", e.getMessage()), e);

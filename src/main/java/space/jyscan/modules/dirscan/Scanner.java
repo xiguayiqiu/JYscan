@@ -2,6 +2,7 @@ package space.jyscan.modules.dirscan;
 
 import space.jyscan.core.util.Colors;
 import space.jyscan.core.util.Fmt;
+import space.jyscan.core.util.TextFiles;
 
 import org.jsoup.Jsoup;
 
@@ -197,7 +198,9 @@ public class Scanner {
         // 加载外部字典文件
         List<String> lines;
         try {
-            lines = Files.readAllLines(Path.of(config.wordlist), StandardCharsets.UTF_8);
+            // 宽容解码（UTF-8→GB18030→ISO-8859-1 兜底）：Go 版按字节读不炸，
+            // Java 严格 UTF-8 会因非法字节抛 MalformedInputException（"Input length = 1"）
+            lines = TextFiles.readLines(Path.of(config.wordlist));
         } catch (Exception e) {
             // Go: fmt.Errorf("无法打开字典文件: %v", err)
             throw new IllegalStateException(Fmt.format("无法打开字典文件: %v", e), e);

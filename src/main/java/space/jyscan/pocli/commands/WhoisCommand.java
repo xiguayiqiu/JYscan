@@ -6,6 +6,7 @@ import picocli.CommandLine.Option;
 import picocli.CommandLine.Parameters;
 import picocli.CommandLine.Spec;
 import space.jyscan.core.util.Colors;
+import space.jyscan.core.util.TextFiles;
 import space.jyscan.modules.whois.Whois;
 import space.jyscan.modules.whois.WhoisResult;
 import space.jyscan.modules.whois.WhoisUtil;
@@ -64,7 +65,8 @@ public class WhoisCommand implements Callable<Integer> {
         // 从文件读取目标列表（跳过空行与 # 注释）
         if (file != null && !file.isEmpty()) {
             try {
-                for (String line : Files.readAllLines(Path.of(file), StandardCharsets.UTF_8)) {
+                // 宽容解码：非 UTF-8 清单文件不再因非法字节报 "读取文件失败"
+                for (String line : TextFiles.readLines(Path.of(file))) {
                     String target = line.trim();
                     if (!target.isEmpty() && !target.startsWith("#")) {
                         queries.add(target);
