@@ -28,7 +28,8 @@ import java.util.concurrent.Callable;
  *   <li>官方 API 全部13个端点（{@link WeakpassClient}）：字典列表/下载、哈希查询
  *       （search）、前缀检索（range）、规则变异生成（generate）；</li>
  *   <li>站内全目录（{@link WeakpassCatalog}）：{@code /wordlists} 分页抓取（上千条
- *       记录），{@code -l} 合并展示，{@code -d} 在 API 404 时回退站内 .7z/.gz 直链。</li>
+ *       记录），{@code -l} 合并展示（带序号；{@code -l <N>} 只显示前 N 条并只抓
+ *       所需页），{@code -d} 在 API 404 时回退站内 .7z/.gz 直链。</li>
  * </ul>
  *
  * <p>freeclient 无对应命令（其 {@code internal/weakpass} 仅为爆破模块空壳注释），
@@ -44,7 +45,8 @@ import java.util.concurrent.Callable;
                 "对接 weakpass.com：API 全部13个端点（列表/下载/查询/检索/生成）+ 站内全目录（/wordlists 分页抓取）与 .7z/.gz 直链下载。",
                 "",
                 "使用示例:",
-                "  ./JYscan passwd -l                          # 列表：API 可直下区 + 站内全目录",
+                "  ./JYscan passwd -l                          # 全部列表：API 区 + 站内全目录（带序号）",
+                "  ./JYscan passwd -l 50                       # 只显示站内目录前 50 条（仅抓前 2 页，约 1 秒）",
                 "  ./JYscan passwd -d rockyou.txt -o dicts     # 下载字典 (GET /wordlists/{name})",
                 "  ./JYscan passwd -d all-h.txt                # API 无此名→站内 .7z 直链（压缩包可达数十GB！）",
                 "  ./JYscan passwd -s e10adc3949ba59abbe56e057f20f883e   # 哈希查明文 (.txt)",
@@ -57,7 +59,7 @@ import java.util.concurrent.Callable;
                 "  ./JYscan passwd -g admin --rule-file - < r.rule       # stdin原始规则 (custom)",
                 "",
                 "参数说明:",
-                "  -l, --list\t\t字典列表（API 可直下区 + 站内全目录）",
+                "  -l, --list [N]\t字典列表（API 区 + 站内全目录，带序号）；给 N=只显示前 N 条（少抓页更快）",
                 "  -d, --download\t下载指定字典（逗号分隔可批量；API 无此名自动尝试站内直链）",
                 "  -a, --all\t\t下载列表中的全部字典（仅 API 区）",
                 "  -s, --search\t\t哈希查询明文（自动识别类型）",
@@ -80,8 +82,10 @@ public class PasswdCommand implements Callable<Integer> {
     /** 服务端 range 端点的 filter 枚举（OpenAPI 规范）。 */
     private static final Set<String> RANGE_FILTERS = Set.of("hash", "pass");
 
-    @Option(names = {"-l", "--list"}, description = "获取密码字典列表（API 可直下区 + 站内全目录）")
-    boolean list;
+    @Option(names = {"-l", "--list"}, arity = "0..1", fallbackValue = "",
+            paramLabel = "[N]",
+            description = "获取密码字典列表（API 区 + 站内全目录，带序号）；给 N 则只显示前 N 条（少抓页更快）")
+    String list;
 
     @Option(names = {"-d", "--download"}, paramLabel = "<name>", split = ",",
             description = "下载指定字典（逗号分隔可批量；API 无此名自动尝试站内直链）")
@@ -137,7 +141,7 @@ public class PasswdCommand implements Callable<Integer> {
         boolean downloads = all || (download != null && !download.isEmpty());
         boolean queries = search != null || range != null || generate != null;
 
-        if (!list && !downloads && !queries) {
+        if (list == null && !downloads && !queries) {
             Colors.errorPrint("请指定 -l/-d/-a/-s/-r/-g 之一（-h 查看帮助）");
             spec.commandLine().usage(System.out);
             return 1;
@@ -145,6 +149,20 @@ public class PasswdCommand implements Callable<Integer> {
         if (ruleFile != null && generate == null) {
             Colors.errorPrint("--rule-file 需要配合 -g/--generate 使用");
             return 1;
+        }
+        // -l 限量参数：空 = 全量；否则须为正整数
+        Integer listLimit = null;
+        if (list != null && !list.isBlank()) {
+            try {
+                int n = Integer.parseInt(list.trim());
+                if (n <= 0) {
+                    throw new NumberFormatException("non-positive");
+                }
+                listLimit = n;
+            } catch (NumberFormatException e) {
+                Colors.errorPrint("-l 条数须为正整数，收到: %v", list.trim());
+                return 1;
+            }
         }
         if (range != null && !RANGE_TYPES.contains(type)) {
             Colors.errorPrint("--type 须为 md5|ntlm|sha1|sha256，收到: %v", type);
@@ -164,8 +182,8 @@ public class PasswdCommand implements Callable<Integer> {
         WeakpassClient client = new WeakpassClient(api);
         int failures = 0;
 
-        if (list) {
-            failures += doList(client);
+        if (list != null) {
+            failures += doList(client, listLimit);
         }
         if (search != null) {
             failures += doSearch(client);
@@ -188,22 +206,24 @@ public class PasswdCommand implements Callable<Integer> {
     // ------------------------------------------------------------------
 
     /**
-     * {@code -l} 合并列表：区1 = 官方 API 列表（{@code -d/-a} 的可下载全集）；
-     * 区2 = 站内全目录（分页抓取，条目为 .7z/.gz 压缩包，与 API 重叠的行标 {@code [API]}）。
-     * 两区各自独立成败，任一失败 → 退出码1。
+     * {@code -l [N]} 合并列表（行首带序号）：区1 = 官方 API 列表（{@code -d/-a} 的
+     * 可下载全集，恒显全部）；区2 = 站内全目录（{@code limit} 非空时只抓够用的页
+     * 并只显示前 N 条，与 API 重叠的行标 {@code [API]}）。两区各自独立成败，
+     * 任一失败 → 退出码1。
      */
-    private int doList(WeakpassClient client) {
+    private int doList(WeakpassClient client, Integer limit) {
         int failures = 0;
         List<String> apiNames = List.of();
 
-        // 区1：官方 API 列表
+        // 区1：官方 API 列表（带序号）
         try {
             apiNames = client.list();
             // 表头走 info（-q 可抑制），条目直出 stdout 便于管道
             Colors.infoPrint("[+] API 字典列表（GET /wordlists，-d 可直下）: 共 %d 个",
                     apiNames.size());
+            int no = 1;
             for (String n : apiNames) {
-                System.out.println(n);
+                System.out.printf(Locale.ROOT, "%6d. %s%n", no++, n);
             }
         } catch (WeakpassClient.ApiException e) {
             Colors.errorPrint("%v", e.getMessage());
@@ -217,18 +237,27 @@ public class PasswdCommand implements Callable<Integer> {
             failures++;
         }
 
-        // 区2：站内全目录（Inertia 分页抓取，全量约10秒）
+        // 区2：站内全目录（limit 非空只抓 ceil(N/per_page) 页，如前50条=2页约1秒）
         try {
             WeakpassCatalog catalog =
                     new WeakpassCatalog(WeakpassCatalog.siteRootOf(api), client);
-            List<WeakpassCatalog.Entry> entries = catalog.fetchAll();
+            WeakpassCatalog.Snapshot snap =
+                    catalog.fetch(limit == null ? null : limit.longValue());
+            List<WeakpassCatalog.Entry> entries = snap.entries();
             Set<String> apiSet = new HashSet<>(apiNames);
-            Colors.infoPrint("[+] 站内全目录（/wordlists 分页抓取）: 共 %d 条"
-                    + "（.7z/.gz 压缩包+种子，-d 走直链）", entries.size());
-            System.out.printf(Locale.ROOT, "%-44s %10s %12s%n", "NAME", "SIZE", "COUNT");
+            if (limit != null && entries.size() < snap.total()) {
+                Colors.infoPrint("[+] 站内全目录（/wordlists 分页抓取）: 共 %d 条，显示前 %d 条"
+                        + "（.7z/.gz 压缩包+种子，-d 走直链）", snap.total(), entries.size());
+            } else {
+                Colors.infoPrint("[+] 站内全目录（/wordlists 分页抓取）: 共 %d 条"
+                        + "（.7z/.gz 压缩包+种子，-d 走直链）", snap.total());
+            }
+            System.out.printf(Locale.ROOT, "%6s. %-44s %10s %12s%n",
+                    "NO", "NAME", "SIZE", "COUNT");
+            int no = 1;
             for (WeakpassCatalog.Entry e : entries) {
-                System.out.printf(Locale.ROOT, "%-44s %10s %12d%s%n",
-                        e.name(), humanSize(e.size()), e.count(),
+                System.out.printf(Locale.ROOT, "%6d. %-44s %10s %12d%s%n",
+                        no++, e.name(), humanSize(e.size()), e.count(),
                         apiSet.contains(e.name()) ? "  [API]" : "");
             }
         } catch (IOException e) {
@@ -369,7 +398,8 @@ public class PasswdCommand implements Callable<Integer> {
         try {
             WeakpassCatalog catalog =
                     new WeakpassCatalog(WeakpassCatalog.siteRootOf(api), client);
-            WeakpassCatalog.Entry e = WeakpassCatalog.find(catalog.fetchAll(), name);
+            WeakpassCatalog.Entry e =
+                    WeakpassCatalog.find(catalog.fetch(null).entries(), name);
             if (e == null) {
                 return 0;
             }

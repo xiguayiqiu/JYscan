@@ -30,11 +30,11 @@ import java.util.regex.Pattern;
  * 每页25条。抓取协议（非官方，页面结构变化会失败）：
  * <ol>
  *   <li>GET {@code {root}/wordlists} → HTML 的 {@code data-page} 属性 = 实体转义的
- *       JSON（含 {@code version} 与第1页数据）；</li>
+ *       JSON（含 {@code version}、第1页数据与分页元信息）；</li>
  *   <li>其余页带 {@code X-Inertia: true} + {@code X-Inertia-Version: <version>}
  *       请求同路径 → 纯 JSON；version 过期返回409（刷新 version 后每页重试一次）。</li>
  * </ol>
- * 分页10路并发，全量约10秒。
+ * 全量分页10路并发约10秒；给定上限时只抓够用的页（如前50条=2页，约1秒）。
  *
  * <p>下载路由来自站内 SPA 的 Ziggy 路由表：{@code GET /download/{id}/{link}}
  * → 302 → {@code https://download.weakpass.com/wordlists/{id}/{download_link}}
@@ -49,6 +49,14 @@ public final class WeakpassCatalog {
     /** 目录记录（保留列表展示与直链下载所需字段）。 */
     public record Entry(long id, String name, String link, String downloadLink,
                         long size, long count, String checksum) {
+    }
+
+    /** 目录抓取快照：entries =（按上限截断后的）记录；total = 站点声称的全目录条数。 */
+    public record Snapshot(List<Entry> entries, long total) {
+    }
+
+    /** 首页（HTML）携带的分页元信息。 */
+    private record FirstPage(long lastPage, long perPage, long total) {
     }
 
     private static final Pattern DATA_PAGE = Pattern.compile("data-page=\"([^\"]*)\"");
@@ -80,48 +88,60 @@ public final class WeakpassCatalog {
     }
 
     /**
-     * 抓取全量目录：首页 HTML（拿 version + 第1页）+ 其余页 X-Inertia JSON 并发抓取。
+     * 抓取目录：首页 HTML（拿 version + 第1页）+ 其余页 X-Inertia JSON 并发抓取。
      *
-     * @return 按站点顺序去重后的全部记录
+     * @param maxEntries 显示上限：非空且为正时只抓够用的页
+     *                   （{@code ceil(N/perPage)}，显著更快）并截断到前 N 条；
+     *                   null = 全量抓取
+     * @return 截断后的记录 + 站点声称的全目录条数（header 展示"共 X 条"用）
      */
-    public List<Entry> fetchAll() throws IOException, InterruptedException {
+    public Snapshot fetch(Long maxEntries) throws IOException, InterruptedException {
         Map<Long, Entry> byId = new LinkedHashMap<>();
-        long lastPage = fetchFirstPage(byId);
-        if (lastPage <= 1) {
-            return List.copyOf(byId.values());
+        FirstPage fp = fetchFirstPage(byId);
+        long lastPage = fp.lastPage();
+        if (maxEntries != null && maxEntries > 0) {
+            long pagesNeeded = (maxEntries + fp.perPage() - 1) / fp.perPage();
+            lastPage = Math.min(lastPage, pagesNeeded);
         }
-        ExecutorService pool = Executors.newFixedThreadPool(
-                (int) Math.min(PAGE_WORKERS, lastPage));
-        try {
-            List<Future<List<Entry>>> futures = new ArrayList<>();
-            for (long p = 2; p <= lastPage; p++) {
-                // 拷贝为 final 局部再入 lambda：兼容 ECJ（Eclipse/m2e 增量编译）对
-                // for 更新变量捕获的严格判定，避免其写出运行期报错的占位 class。
-                final long pageNo = p;
-                futures.add(pool.submit(() -> fetchPageJson(pageNo)));
-            }
-            for (Future<List<Entry>> f : futures) {
-                List<Entry> pageEntries;
-                try {
-                    pageEntries = f.get();
-                } catch (ExecutionException e) {
-                    Throwable c = e.getCause();
-                    if (c instanceof InterruptedException ie) {
-                        throw ie;
-                    }
-                    if (c instanceof IOException ioe) {
-                        throw ioe;
-                    }
-                    throw new IOException("站内目录抓取失败: " + c, c);
+        if (lastPage > 1) {
+            ExecutorService pool = Executors.newFixedThreadPool(
+                    (int) Math.min(PAGE_WORKERS, lastPage));
+            try {
+                List<Future<List<Entry>>> futures = new ArrayList<>();
+                for (long p = 2; p <= lastPage; p++) {
+                    // 拷贝为 final 局部再入 lambda：兼容 ECJ（Eclipse/m2e 增量编译）对
+                    // for 更新变量捕获的严格判定，避免其写出运行期报错的占位 class。
+                    final long pageNo = p;
+                    futures.add(pool.submit(() -> fetchPageJson(pageNo)));
                 }
-                for (Entry entry : pageEntries) {
-                    byId.putIfAbsent(entry.id(), entry);
+                for (Future<List<Entry>> f : futures) {
+                    List<Entry> pageEntries;
+                    try {
+                        pageEntries = f.get();
+                    } catch (ExecutionException e) {
+                        Throwable c = e.getCause();
+                        if (c instanceof InterruptedException ie) {
+                            throw ie;
+                        }
+                        if (c instanceof IOException ioe) {
+                            throw ioe;
+                        }
+                        throw new IOException("站内目录抓取失败: " + c, c);
+                    }
+                    for (Entry entry : pageEntries) {
+                        byId.putIfAbsent(entry.id(), entry);
+                    }
                 }
+            } finally {
+                pool.shutdownNow();
             }
-        } finally {
-            pool.shutdownNow();
         }
-        return List.copyOf(byId.values());
+        long total = Math.max(fp.total(), byId.size());
+        List<Entry> entries = new ArrayList<>(byId.values());
+        if (maxEntries != null && entries.size() > maxEntries) {
+            entries = new ArrayList<>(entries.subList(0, maxEntries.intValue()));
+        }
+        return new Snapshot(List.copyOf(entries), total);
     }
 
     /** 按 name / download_link / link 精确匹配，再退化为 name 忽略大小写；无则 {@code null}。 */
@@ -163,8 +183,9 @@ public final class WeakpassCatalog {
     // 页面解析（Inertia data-page / X-Inertia JSON）
     // ------------------------------------------------------------------
 
-    /** 首页（HTML）：解析 {@code data-page} → version + 第1页记录，返回总页数。 */
-    private long fetchFirstPage(Map<Long, Entry> byId) throws IOException, InterruptedException {
+    /** 首页（HTML）：解析 {@code data-page} → version + 第1页记录，返回分页元信息。 */
+    private FirstPage fetchFirstPage(Map<Long, Entry> byId)
+            throws IOException, InterruptedException {
         HttpResponse<String> resp = transport.sendString(
                 transport.requestBuilder(siteRoot + "/wordlists").GET().build());
         if (resp.statusCode() != 200) {
@@ -180,8 +201,9 @@ public final class WeakpassCatalog {
         for (Entry e : parseEntries(wl.path("data"))) {
             byId.putIfAbsent(e.id(), e);
         }
-        long lastPage = lng(wl, "last_page");
-        return Math.max(lastPage, 1);
+        long lastPage = Math.max(lng(wl, "last_page"), 1);
+        long perPage = Math.max(lng(wl, "per_page"), 1);
+        return new FirstPage(lastPage, perPage, lng(wl, "total"));
     }
 
     /** 后续页（X-Inertia JSON）；409 = version 过期 → 刷新后重试一次。 */
@@ -207,7 +229,7 @@ public final class WeakpassCatalog {
         throw new IOException("站内目录 page " + pageNo + " 版本协商失败（连续409）");
     }
 
-    /**409 后刷新 Inertia version（重新抓首页 HTML）。 */
+    /** 409 后刷新 Inertia version（重新抓首页 HTML）。 */
     private synchronized void refreshVersion() throws IOException, InterruptedException {
         HttpResponse<String> resp = transport.sendString(
                 transport.requestBuilder(siteRoot + "/wordlists").GET().build());
