@@ -56,6 +56,15 @@
       <version>3.6.3</version>
     </dependency>
 
+    <!-- dnsjava 传递引入 slf4j-api 但无实现绑定，每次 sub 运行都刷3行
+         "Failed to load class StaticLoggerBinder" 警告；NOP 实现静默之 -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-nop</artifactId>
+      <version>1.7.36</version>
+      <scope>runtime</scope>
+    </dependency>
+
     <!-- 原生调用（raw socket / ICMP traceroute，对应 Go 的 golang.org/x/net/icmp） -->
     <dependency>
       <groupId>net.java.dev.jna</groupId>

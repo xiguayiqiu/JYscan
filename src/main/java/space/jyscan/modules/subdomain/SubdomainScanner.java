@@ -41,7 +41,8 @@ import java.util.regex.Pattern;
  * <p>实现映射：
  * <ul>
  *   <li>DNS 查询：Go 用 miekg/dns 直连 {@code 8.8.8.8:53}，这里用 dnsjava
- *       {@link SimpleResolver} 等价实现；</li>
+ *       {@link SimpleResolver}，但服务器改为「系统 /etc/resolv.conf 优先、
+ *       失败逐个换、末尾回退 8.8.8.8」（见偏差列表）；</li>
  *   <li>通配符检测：5 次随机子域 A 查询，收集命中的 IP，后续命中同样 IP 的候选直接丢弃；</li>
  *   <li>并发模型：Go 的 {@code jobs chan} + N 个 goroutine → Java 的
  *       {@link Executors#newFixedThreadPool} + 任务队列；</li>
@@ -53,13 +54,50 @@ import java.util.regex.Pattern;
  *   <li>{@code -T/--type}：Go 侧 {@code scanSubdomain} 固定查 A 记录，该 flag 实际未生效；
  *       这里按 flag 文档让它参与查询（默认 A 时行为与 Go 完全一致）；</li>
  *   <li>{@code -f/--output}：Go 侧 {@code saveResults} 定义了但从未调用，输出文件永远不落盘；
- *       这里按 flag 文档在扫描结束后调用一次。</li>
+ *       这里按 flag 文档在扫描结束后调用一次；</li>
+ *   <li>DNS 服务器：Go 硬编码 8.8.8.8；国内实测其丢包约 20%、RTT 均值 572ms
+ *       （系统 resolver 24ms 零失败），在 1s 读超时下子域名被随机丢弃。
+ *       这里改为系统 resolver 优先 + 8.8.8.8 兜底，失败自动换下一家。</li>
  * </ul>
  */
 public final class SubdomainScanner {
 
-    /** 固定使用的公共 DNS（与 Go 的 "8.8.8.8:53" 一致）。 */
-    private static final String DNS_SERVER = "8.8.8.8";
+    /** 回退公共 DNS（Go 硬编码的 "8.8.8.8:53" 原值）。 */
+    private static final String FALLBACK_DNS_SERVER = "8.8.8.8";
+
+    /**
+     * 查询用 DNS 服务器序列：系统 /etc/resolv.conf 的 IPv4 nameserver 优先，
+     * 末尾追加 Go 原值 8.8.8.8 兜底。与 Go 的有意偏差——实测 8.8.8.8 国内
+     * 丢包约 20%、RTT 均值 572ms，1s 读超时下结果被随机丢弃（同一批词表
+     * 反复跑出 1/2/3 个不同结果）；系统 resolver 24ms 零失败。进程内解析一次。
+     */
+    private static final List<String> DNS_SERVERS = resolveDnsServers();
+
+    /**
+     * 解析 /etc/resolv.conf 的 nameserver（仅 IPv4：链路本地 IPv6 缺 scope id
+     * 无法直用），读不到时仅保留回退 DNS。
+     */
+    private static List<String> resolveDnsServers() {
+        List<String> servers = new ArrayList<>();
+        try {
+            for (String line : Files.readAllLines(Path.of("/etc/resolv.conf"))) {
+                String trimmed = line.trim();
+                if (!trimmed.startsWith("nameserver")) {
+                    continue;
+                }
+                String[] parts = trimmed.split("\\s+");
+                if (parts.length >= 2 && !parts[1].contains(":") && !servers.contains(parts[1])) {
+                    servers.add(parts[1]);
+                }
+            }
+        } catch (Exception ignored) {
+            // 读不到（非 Unix / 无权限）→ 只走回退 DNS，与 Go 行为一致
+        }
+        if (!servers.contains(FALLBACK_DNS_SERVER)) {
+            servers.add(FALLBACK_DNS_SERVER);
+        }
+        return List.copyOf(servers);
+    }
 
     /** 单次 A 查询超时，与 Go 的 {@code c.ReadTimeout = 1 * time.Second} 一致。 */
     private static final Duration SCAN_DNS_TIMEOUT = Duration.ofSeconds(1);
@@ -205,48 +243,62 @@ public final class SubdomainScanner {
     // =====================================================================
 
     /**
-     * 向 {@link #DNS_SERVER} 查询指定类型并收集答案区的记录值。
+     * 依次向 {@link #DNS_SERVERS} 查询指定类型并收集答案区的记录值。
+     *
+     * <p>与 Go 的偏差：Go 只查硬编码的 8.8.8.8 一次，失败即视为无结果；
+     * 这里按序列逐个尝试——超时/不可达/SERVFAIL/REFUSED 换下一家，
+     * NOERROR/NXDOMAIN 等明确答复直接返回（NXDOMAIN 是权威结论，不再重试）。
      *
      * @param target  目标名（会自动补全为 FQDN）
      * @param qtype   查询类型（{@link Type}）
      * @param timeout 读超时
      * @param aOnly   是否只取 A 记录（Go 的 detectWildcard / scanSubdomain 都用 {@code *dns.A} 分支）
-     * @return 答案列表；查询失败返回空列表（对应 Go 的 err != nil / Rcode != Success）
+     * @return 答案列表；所有服务器都失败返回空列表（对应 Go 的 err != nil / Rcode != Success）
      */
     private static List<String> queryAnswers(String target, int qtype, Duration timeout,
                                              boolean aOnly) {
         List<String> out = new ArrayList<>();
-        try {
-            SimpleResolver resolver = new SimpleResolver(DNS_SERVER);
-            resolver.setPort(53);
-            if (timeout != null && !timeout.isZero() && !timeout.isNegative()) {
-                resolver.setTimeout(timeout);
-            } else {
-                resolver.setTimeout(Duration.ofSeconds(1));
-            }
-            Name qname = Name.fromString(target, Name.root);
-            Message query = Message.newQuery(Record.newRecord(qname, qtype, DClass.IN));
-            Message in = resolver.send(query);
-
-            if (in.getRcode() != org.xbill.DNS.Rcode.NOERROR) {
-                return out;
-            }
-            for (Record r : in.getSectionArray(Section.ANSWER)) {
-                if (aOnly) {
-                    if (r instanceof ARecord a) {
-                        out.add(a.getAddress().getHostAddress());
-                    }
-                } else if (r instanceof ARecord a) {
-                    out.add(a.getAddress().getHostAddress());
-                } else if (r instanceof CNAMERecord c) {
-                    out.add(c.getTarget().toString());
+        for (String server : DNS_SERVERS) {
+            try {
+                SimpleResolver resolver = new SimpleResolver(server);
+                resolver.setPort(53);
+                if (timeout != null && !timeout.isZero() && !timeout.isNegative()) {
+                    resolver.setTimeout(timeout);
                 } else {
-                    out.add(r.toString());
+                    resolver.setTimeout(Duration.ofSeconds(1));
                 }
+                Name qname = Name.fromString(target, Name.root);
+                Message query = Message.newQuery(
+                        org.xbill.DNS.Record.newRecord(qname, qtype, DClass.IN));
+                Message in = resolver.send(query);
+
+                int rcode = in.getRcode();
+                if (rcode != org.xbill.DNS.Rcode.NOERROR) {
+                    // SERVFAIL/REFUSED 是服务器侧故障 → 换下一家；NXDOMAIN 等明确答复直接返回
+                    if (rcode == org.xbill.DNS.Rcode.SERVFAIL
+                            || rcode == org.xbill.DNS.Rcode.REFUSED) {
+                        continue;
+                    }
+                    return out;
+                }
+                for (Record r : in.getSectionArray(Section.ANSWER)) {
+                    if (aOnly) {
+                        if (r instanceof ARecord a) {
+                            out.add(a.getAddress().getHostAddress());
+                        }
+                    } else if (r instanceof ARecord a) {
+                        out.add(a.getAddress().getHostAddress());
+                    } else if (r instanceof CNAMERecord c) {
+                        out.add(c.getTarget().toString());
+                    } else {
+                        out.add(r.toString());
+                    }
+                }
+                return out;
+            } catch (Exception e) {
+                // 超时 / 不可达 → 尝试下一个服务器（与 Go「网络失败按无结果处理」
+                // 的语义一致，只是多了一次换源机会）
             }
-        } catch (Exception e) {
-            // 与 Go 一致：网络失败按「无结果」处理，不向上抛
-            out.clear();
         }
         return out;
     }
@@ -434,8 +486,10 @@ public final class SubdomainScanner {
                 HttpRequest req = HttpRequest.newBuilder(URI.create(url))
                         .GET()
                         .timeout(httpTimeout)
-                        // Go: req.Host = domain（Java HttpClient 用 Host 头表达）
-                        .header("Host", domain)
+                        // Go: req.Host = domain —— Java 不需要：URL 里已带 domain，
+                        // Host 头由 HttpClient 自动生成。显式设置会抛
+                        // IAE("restricted header name: Host")（曾导致 HTTP 验证
+                        // 全部失败、所有子域名被丢弃）
                         // Go 的 UA 原值即 freeclient/1.0，按移植约定保留
                         .header("User-Agent", "freeclient/1.0")
                         .build();
