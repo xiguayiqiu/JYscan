@@ -88,7 +88,7 @@ public final class WeakpassCatalog {
     }
 
     /**
-     * 抓取目录：首页 HTML（拿 version + 第1页）+ 其余页 X-Inertia JSON 并发抓取。
+     * 抓取目录（全量或前 N 条）：首页 HTML（拿 version + 第1页）+ 其余页并发抓取。
      *
      * @param maxEntries 显示上限：非空且为正时只抓够用的页
      *                   （{@code ceil(N/perPage)}，显著更快）并截断到前 N 条；
@@ -96,52 +96,85 @@ public final class WeakpassCatalog {
      * @return 截断后的记录 + 站点声称的全目录条数（header 展示"共 X 条"用）
      */
     public Snapshot fetch(Long maxEntries) throws IOException, InterruptedException {
+        return fetchRange(1, maxEntries == null ? Long.MAX_VALUE : maxEntries);
+    }
+
+    /**
+     * 抓取第 {@code from} 到 {@code to} 条（1-based 闭区间）：只抓覆盖该区间的页
+     * （如每页25条时第12-15条只需首页），返回值含站点总条数。
+     *
+     * <p>区间超出全目录范围时返回空 entries（total 仍为站点总数），由调用方判定报错。
+     */
+    public Snapshot fetchRange(long from, long to) throws IOException, InterruptedException {
+        if (from < 1) {
+            from = 1;
+        }
         Map<Long, Entry> byId = new LinkedHashMap<>();
         FirstPage fp = fetchFirstPage(byId);
+        long perPage = fp.perPage();
         long lastPage = fp.lastPage();
-        if (maxEntries != null && maxEntries > 0) {
-            long pagesNeeded = (maxEntries + fp.perPage() - 1) / fp.perPage();
-            lastPage = Math.min(lastPage, pagesNeeded);
+        long total = fp.total();
+        long effTo = total > 0 ? Math.min(to, total) : to;
+        if (effTo < from) {
+            return new Snapshot(List.of(), total);
         }
-        if (lastPage > 1) {
-            ExecutorService pool = Executors.newFixedThreadPool(
-                    (int) Math.min(PAGE_WORKERS, lastPage));
-            try {
-                List<Future<List<Entry>>> futures = new ArrayList<>();
-                for (long p = 2; p <= lastPage; p++) {
-                    // 拷贝为 final 局部再入 lambda：兼容 ECJ（Eclipse/m2e 增量编译）对
-                    // for 更新变量捕获的严格判定，避免其写出运行期报错的占位 class。
-                    final long pageNo = p;
-                    futures.add(pool.submit(() -> fetchPageJson(pageNo)));
-                }
-                for (Future<List<Entry>> f : futures) {
-                    List<Entry> pageEntries;
-                    try {
-                        pageEntries = f.get();
-                    } catch (ExecutionException e) {
-                        Throwable c = e.getCause();
-                        if (c instanceof InterruptedException ie) {
-                            throw ie;
-                        }
-                        if (c instanceof IOException ioe) {
-                            throw ioe;
-                        }
-                        throw new IOException("站内目录抓取失败: " + c, c);
-                    }
-                    for (Entry entry : pageEntries) {
-                        byId.putIfAbsent(entry.id(), entry);
-                    }
-                }
-            } finally {
-                pool.shutdownNow();
+        long fromPage = (from - 1) / perPage + 1;
+        long toPage = (effTo - 1) / perPage + 1;
+        if (toPage > lastPage) {
+            toPage = lastPage;
+        }
+        if (fromPage > 1) {
+            byId.clear(); // 只需元信息：第1页记录不属于目标区间
+        }
+        fetchPagesInto(byId, Math.max(2, fromPage), toPage);
+        long startRow = (fromPage - 1) * perPage + 1;
+        List<Entry> all = new ArrayList<>(byId.values());
+        List<Entry> out = new ArrayList<>();
+        for (long i = from - startRow, end = effTo - startRow; i <= end && i < all.size(); i++) {
+            if (i >= 0) {
+                out.add(all.get((int) i));
             }
         }
-        long total = Math.max(fp.total(), byId.size());
-        List<Entry> entries = new ArrayList<>(byId.values());
-        if (maxEntries != null && entries.size() > maxEntries) {
-            entries = new ArrayList<>(entries.subList(0, maxEntries.intValue()));
+        return new Snapshot(List.copyOf(out), Math.max(total, startRow - 1 + all.size()));
+    }
+
+    /** 并发抓取 [fromPage, toPage] 的 X-Inertia 页，按页序并入 {@code byId}。 */
+    private void fetchPagesInto(Map<Long, Entry> byId, long fromPage, long toPage)
+            throws IOException, InterruptedException {
+        if (toPage < fromPage) {
+            return;
         }
-        return new Snapshot(List.copyOf(entries), total);
+        ExecutorService pool = Executors.newFixedThreadPool(
+                (int) Math.min(PAGE_WORKERS, toPage - fromPage + 1));
+        try {
+            List<Future<List<Entry>>> futures = new ArrayList<>();
+            for (long p = fromPage; p <= toPage; p++) {
+                // 拷贝为 final 局部再入 lambda：兼容 ECJ（Eclipse/m2e 增量编译）对
+                // for 更新变量捕获的严格判定，避免其写出运行期报错的占位 class。
+                final long pageNo = p;
+                futures.add(pool.submit(() -> fetchPageJson(pageNo)));
+            }
+            for (Future<List<Entry>> f : futures) {
+                List<Entry> pageEntries;
+                try {
+                    pageEntries = f.get();
+                } catch (ExecutionException e) {
+                    Throwable c = e.getCause();
+                    if (c instanceof InterruptedException ie) {
+                        throw ie;
+                    }
+                    if (c instanceof IOException ioe) {
+                        throw ioe;
+                    }
+                    throw new IOException("站内目录抓取失败: " + c, c);
+                }
+                for (Entry entry : pageEntries) {
+                    byId.putIfAbsent(entry.id(), entry);
+                }
+            }
+        } finally {
+            pool.shutdownNow();
+        }
     }
 
     /** 按 name / download_link / link 精确匹配，再退化为 name 忽略大小写；无则 {@code null}。 */
@@ -173,10 +206,16 @@ public final class WeakpassCatalog {
      * @return 实际写入字节数（压缩包大小）
      */
     public long download(Entry e, OutputStream out) throws IOException, InterruptedException {
+        return download(e, out, null);
+    }
+
+    /** 同 {@link #download(Entry, OutputStream)}，可选进度回调（进度条用）。 */
+    public long download(Entry e, OutputStream out, WeakpassClient.ProgressListener progress)
+            throws IOException, InterruptedException {
         String url = siteRoot + "/download/" + e.id() + "/"
                 + URLEncoder.encode(e.link(), StandardCharsets.UTF_8).replace("+", "%20");
         return transport.streamTo(transport.requestBuilder(url).GET().build(),
-                "站内下载", e.downloadLink(), out);
+                "站内下载", e.downloadLink(), out, progress);
     }
 
     // ------------------------------------------------------------------

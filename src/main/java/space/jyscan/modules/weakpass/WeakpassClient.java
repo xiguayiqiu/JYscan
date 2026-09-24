@@ -129,12 +129,28 @@ public final class WeakpassClient {
     }
 
     /**
+     * 下载/流式传输进度回调：{@code (总大小, 已下载字节数)}。总大小取
+     * Content-Length，缺失时为 -1（渲染侧应忽略该帧）。回调可能来自读取线程，
+     * 实现须自行节流/同步。
+     */
+    @FunctionalInterface
+    public interface ProgressListener {
+        void onProgress(long total, long loaded);
+    }
+
+    /**
      * GET /wordlists/{name} → 流式写入 {@code target}，返回写入字节数。
      *
      * <p>名字先经 {@link #requireSafeName} 校验（防路径穿越），失败时由调用方
      * 负责删除半成品文件（本方法内部出错同样会留下部分文件，交给调用方清理）。
      */
     public long download(String name, Path target) throws IOException, InterruptedException {
+        return download(name, target, null);
+    }
+
+    /** 同 {@link #download(String, Path)}，可选进度回调（进度条用）。 */
+    public long download(String name, Path target, ProgressListener progress)
+            throws IOException, InterruptedException {
         requireSafeName(name);
         // 注意：不设 HttpRequest.timeout —— JDK 计时器会连 body 一起掐（见类注释）；
         // 响应头阶段由下面的 get(15s+2s) 兜底，body 阶段由 copyWithIdleGuard 兜底。
@@ -165,8 +181,11 @@ public final class WeakpassClient {
             throw statusException(code, snippet, "下载");
         }
 
+        long total = resp.headers().firstValueAsLong("Content-Length").orElse(-1L);
         try (InputStream in = resp.body();
-             OutputStream out = Files.newOutputStream(target)) {
+             OutputStream raw = Files.newOutputStream(target)) {
+            OutputStream out = progress == null ? raw
+                    : new ProgressOutputStream(raw, progress, total);
             return copyWithIdleGuard(name, in, out);
         }
     }
@@ -334,6 +353,13 @@ public final class WeakpassClient {
      */
     long streamTo(HttpRequest req, String what, String nameForMsg, OutputStream out)
             throws IOException, InterruptedException {
+        return streamTo(req, what, nameForMsg, out, null);
+    }
+
+    /** 同 {@link #streamTo(HttpRequest, String, String, OutputStream)}，可选进度回调。 */
+    long streamTo(HttpRequest req, String what, String nameForMsg, OutputStream out,
+                  ProgressListener progress)
+            throws IOException, InterruptedException {
         HttpResponse<InputStream> resp = sendStream(req);
         int code = resp.statusCode();
         if (code != 200) {
@@ -345,8 +371,48 @@ public final class WeakpassClient {
             }
             throw statusException(code, snippet, what);
         }
+        long total = resp.headers().firstValueAsLong("Content-Length").orElse(-1L);
+        OutputStream sink = progress == null ? out : new ProgressOutputStream(out, progress, total);
         try (InputStream in = resp.body()) {
-            return copyWithIdleGuard(nameForMsg, in, out);
+            return copyWithIdleGuard(nameForMsg, in, sink);
+        }
+    }
+
+    /** 包装输出流：每写完一块回调进度（已写字节数在本流内统计，节流由监听器负责）。 */
+    private static final class ProgressOutputStream extends OutputStream {
+        private final OutputStream delegate;
+        private final ProgressListener listener;
+        private final long total;
+        private long loaded;
+
+        ProgressOutputStream(OutputStream delegate, ProgressListener listener, long total) {
+            this.delegate = delegate;
+            this.listener = listener;
+            this.total = total;
+        }
+
+        @Override
+        public void write(int b) throws IOException {
+            delegate.write(b);
+            loaded++;
+            listener.onProgress(total, loaded);
+        }
+
+        @Override
+        public void write(byte[] b, int off, int len) throws IOException {
+            delegate.write(b, off, len);
+            loaded += len;
+            listener.onProgress(total, loaded);
+        }
+
+        @Override
+        public void flush() throws IOException {
+            delegate.flush();
+        }
+
+        @Override
+        public void close() throws IOException {
+            delegate.close();
         }
     }
 
