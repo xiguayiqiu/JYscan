@@ -304,14 +304,16 @@ public final class WeakpassClient {
     // 内部实现
     // ------------------------------------------------------------------
 
-    private HttpRequest.Builder requestBuilder(String url) {
+    // 以下三个方法放宽为包内可见：WeakpassCatalog（站内目录抓取/直链下载）复用本类传输层。
+
+    HttpRequest.Builder requestBuilder(String url) {
         return HttpRequest.newBuilder(URI.create(url))
                 .header("Accept", "text/plain, */*")
                 .header("User-Agent", "JYscan");
     }
 
     /** 小载荷全限时发送：ofString 完成 = 头 + 体全部收齐，get 盖住整个往返。 */
-    private HttpResponse<String> sendString(HttpRequest req)
+    HttpResponse<String> sendString(HttpRequest req)
             throws IOException, InterruptedException {
         CompletableFuture<HttpResponse<String>> pending =
                 client.sendAsync(req, HttpResponse.BodyHandlers.ofString());
@@ -330,7 +332,7 @@ public final class WeakpassClient {
      * {@code HttpRequest.timeout}），非 2xx 读错误体成 {@link ApiException}，
      * 200 的 body 过 {@link #copyWithIdleGuard} 写 {@code out}。
      */
-    private long streamTo(HttpRequest req, String what, String nameForMsg, OutputStream out)
+    long streamTo(HttpRequest req, String what, String nameForMsg, OutputStream out)
             throws IOException, InterruptedException {
         HttpResponse<InputStream> resp = sendStream(req);
         int code = resp.statusCode();
