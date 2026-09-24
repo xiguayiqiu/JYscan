@@ -16,6 +16,7 @@ import space.jyscan.pocli.commands.DnsCommand;
 import space.jyscan.pocli.commands.CdnCommand;
 import space.jyscan.pocli.commands.SubCommand;
 import space.jyscan.pocli.commands.SitemapCommand;
+import space.jyscan.pocli.commands.NucleiCommand;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -63,6 +64,9 @@ public final class Registry {
         // ==================== Web ====================
         register("webshell", CommandGroup.WEB, new WebshellCommand());
         register("waf", CommandGroup.WEB, new WafCommand());
+
+        // ==================== 测试阶段命令 ====================
+        register("nuclei", CommandGroup.TESTING, new NucleiCommand());
     }
 
     private Registry() {

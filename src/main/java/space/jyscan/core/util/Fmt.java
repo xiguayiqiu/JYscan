@@ -1,6 +1,8 @@
 package space.jyscan.core.util;
 
 import java.lang.reflect.Array;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Duration;
 import java.util.Iterator;
 import java.util.Map;
@@ -131,6 +133,29 @@ public final class Fmt {
             out.append(rendered);
         }
 
+        // Go 的语义：格式串消费完毕后仍有剩余参数时追加 %!(EXTRA type=value, ...)
+        // （对应 fmt/print.go 中 doPrintf 收尾处，与上面的 (MISSING) 成对）。
+        // Go 仅在未使用显式下标 %[1]v 时输出该后缀（`!p.reordered` 条件），
+        // 而本格式层不支持显式下标，故等价于无条件输出。
+        // 值本身按 %v 渲染，其中的 % 不会被二次解释（Go 实测：string=100% sure）。
+        if (idx < args.length) {
+            out.append("%!(EXTRA ");
+            for (int k = idx; k < args.length; k++) {
+                if (k > idx) {
+                    out.append(", ");
+                }
+                if (args[k] == null) {
+                    // Go 对 nil 实参只输出裸 <nil>，不带 "=" 和值
+                    out.append("<nil>");
+                    continue;
+                }
+                out.append(goTypeName(args[k]));
+                out.append('=');
+                out.append(goDefault(args[k], -1));
+            }
+            out.append(')');
+        }
+
         return out.toString();
     }
 
@@ -234,51 +259,70 @@ public final class Fmt {
         return String.valueOf(num.longValue());
     }
 
-    /** Go 的 Duration.String()：如 "1.5s"、"2m3.5s"、"500ms"。 */
+    /**
+     * Go 的 {@code time.Duration.String()}（{@code time/time.go} 的 {@code Duration.format}），逐分支照抄：
+     * <ul>
+     *   <li>0 → {@code "0s"}；</li>
+     *   <li>亚秒按量级用 {@code ns}/{@code µs}/{@code ms}（小数分别 0/3/6 位、尾零裁剪、全零不出小数点），
+     *       {@code µ} 为 U+00B5（Go 源注释明确 {@code 0xC2 0xB5}）；</li>
+     *   <li>≥1s 秒部<b>恒打印</b>（小数 9 位、尾零裁剪），分钟仅在总分钟数&gt;0 时出现
+     *       （分钟为 0 时写 {@code 0m}），小时仅在&gt;0 时出现；<b>没有</b> {@code d} 天单位
+     *       （Go 源注释：Stop at hours because days can be different lengths）。</li>
+     * </ul>
+     * 如 "1.5s"、"2m3.5s"、"500ms"、"394.774619ms"、"24h0m0s"。
+     *
+     * <p>对拍依据：{@code /tmp/opencode/durcheck}（34 个纳秒值的 Go 地面真值）。
+     */
     private static String goDuration(Duration d) {
         long nanos = d.toNanos();
         if (nanos == 0) {
             return "0s";
         }
-        String sign = "";
-        if (nanos < 0) {
-            sign = "-";
-            nanos = -nanos;
-        }
-        long sec = nanos / 1_000_000_000L;
-        long rem = nanos % 1_000_000_000L;
+        boolean neg = nanos < 0;
+        // Go: u := uint64(d); if neg { u = -u }。两补码下 Long.MIN_VALUE 取负仍为
+        // Long.MIN_VALUE，其无符号值恰为 |d|，配合下面的无符号除/余运算语义与 Go 一致。
+        long u = neg ? -nanos : nanos;
 
-        long days = sec / 86400;
-        sec %= 86400;
-        long hours = sec / 3600;
-        sec %= 3600;
-        long mins = sec / 60;
-        sec %= 60;
-
-        StringBuilder sb = new StringBuilder(sign);
-        if (days > 0) {
-            sb.append(days).append('d');
+        StringBuilder sb = new StringBuilder();
+        if (neg) {
+            sb.append('-');
         }
+        if (Long.compareUnsigned(u, 1_000_000_000L) < 0) {
+            // 亚秒：Go 的 u < Second 分支
+            if (u < 1_000L) {
+                return sb.append(u).append("ns").toString();
+            }
+            if (u < 1_000_000L) {
+                appendFrac(sb, u / 1_000L, u % 1_000L, 3);
+                return sb.append('µ').append('s').toString();
+            }
+            appendFrac(sb, u / 1_000_000L, u % 1_000_000L, 6);
+            return sb.append("ms").toString();
+        }
+        long secs = Long.divideUnsigned(u, 1_000_000_000L);
+        long frac = Long.remainderUnsigned(u, 1_000_000_000L);
+        long hours = secs / 3600;
+        long mins = secs / 60 % 60;
+        long s = secs % 60;
         if (hours > 0) {
-            sb.append(hours).append("h");
+            sb.append(hours).append('h');
         }
-        if (mins > 0) {
-            sb.append(mins).append("m");
+        if (secs / 60 > 0) {
+            sb.append(mins).append('m');
         }
-        boolean needSeconds = sb.length() == 0 || rem != 0 || sec != 0;
-        if (needSeconds) {
-            if (sb.length() > 0 && (rem != 0 || sb.charAt(sb.length() - 1) == 'm')) {
-                // 分钟之后带秒
-            }
-            if (rem == 0) {
-                sb.append(sec).append("s");
-            } else {
-                String frac = padLeft(Long.toString(rem), 9, '0');
-                frac = stripTrailingZeros(frac);
-                sb.append(sec).append('.').append(frac).append('s');
-            }
+        appendFrac(sb, s, frac, 9);
+        return sb.append('s').toString();
+    }
+
+    /**
+     * Go 的 {@code fmtFrac} + {@code fmtInt} 组合：整数部，小数非零时再追加
+     * {@code "." + 去尾零的 prec 位小数}（全零则不出小数点）。
+     */
+    private static void appendFrac(StringBuilder sb, long ip, long frac, int prec) {
+        sb.append(ip);
+        if (frac != 0) {
+            sb.append('.').append(stripTrailingZeros(padLeft(Long.toString(frac), prec, '0')));
         }
-        return sb.toString();
     }
 
     /** 左侧补字符（Java 标准库没有 String.padStart）。 */
@@ -348,7 +392,23 @@ public final class Fmt {
         if (arg == null) {
             return "<nil>";
         }
+        if (arg instanceof Character c) {
+            // Go 的 %q 对单个字符走 strconv.QuoteRune，输出单引号字面量（'A'）
+            return "'" + runeEscaped(c) + "'";
+        }
         return quoteString(String.valueOf(arg));
+    }
+
+    /** 单引号字面量内部的转义（引号与双引号字符串不同，' 要转义、" 不转义）。 */
+    private static String runeEscaped(char c) {
+        return switch (c) {
+            case '\'' -> "\\'";
+            case '\\' -> "\\\\";
+            case '\n' -> "\\n";
+            case '\r' -> "\\r";
+            case '\t' -> "\\t";
+            default -> (c < 0x20 || c == 0x7f) ? String.format("\\x%02x", (int) c) : String.valueOf(c);
+        };
     }
 
     /** Go 风格双引号字符串字面量。 */
@@ -375,13 +435,61 @@ public final class Fmt {
         return sb.append('"').toString();
     }
 
+    /**
+     * Go 的类型名，对应 {@code reflect.TypeOf(x).String()}，供 {@code %T} 与
+     * {@code %!(EXTRA …)} 共用。
+     *
+     * <p>把 Java 装箱类型映射到 Go 的基本类型名（{@code string}/{@code int}/{@code int64}/
+     * {@code float64}/{@code bool}/{@code rune}），{@link Duration} 映射到
+     * {@code time.Duration}；数组按 Go 切片写作 {@code []elem}（前缀，不是 Java 的
+     * {@code elem[]}），其中 {@code byte[]} 对应 Go 的 {@code []byte} 别名 {@code []uint8}。
+     * 其余类型回退到 Java 简单类名 —— Go/Java 类型体系不同，无法诚实对应。
+     *
+     * <p><b>已知偏差：</b>Go 的错误值会带 Go 侧具体类型（{@code *fs.PathError}、
+     * {@code *errors.errorString}）与 Go 文案，Java 异常对象没有可诚实对应的映射，
+     * 只能给出 Java 类名 + {@link Throwable#getMessage()}，故含错误参数的
+     * {@code %!(EXTRA …)} 段与 Go 逐字不同。这是 Go/Java 异常表示差异，非格式化缺陷。
+     */
     private static String goTypeName(Object arg) {
         if (arg == null) {
             return "<nil>";
         }
-        Class<?> cls = arg.getClass();
-        if (arg.getClass().isArray()) {
-            return goTypeName(Array.get(arg, 0)) + "[]";
+        return goTypeOf(arg.getClass());
+    }
+
+    /** {@link #goTypeName} 的按类型实现，数组走类型而非首元素，空数组不会越界。 */
+    private static String goTypeOf(Class<?> cls) {
+        if (cls == null) {
+            return "<nil>";
+        }
+        if (cls == String.class) {
+            return "string";
+        }
+        if (cls == int.class || cls == Integer.class
+                || cls == short.class || cls == Short.class
+                || cls == byte.class || cls == Byte.class) {
+            return "int";
+        }
+        if (cls == long.class || cls == Long.class) {
+            return "int64";
+        }
+        if (cls == double.class || cls == Double.class || cls == float.class || cls == Float.class) {
+            return "float64";
+        }
+        if (cls == boolean.class || cls == Boolean.class) {
+            return "bool";
+        }
+        if (cls == char.class || cls == Character.class) {
+            return "rune";
+        }
+        if (cls == Duration.class) {
+            return "time.Duration";
+        }
+        if (cls == byte[].class) {
+            return "[]uint8";   // Go 的 []byte 就是 []uint8
+        }
+        if (cls.isArray()) {
+            return "[]" + goTypeOf(cls.getComponentType());
         }
         // Go 里包名带路径，Java 侧返回简单类名即可
         String name = cls.getName();
@@ -495,7 +603,7 @@ public final class Fmt {
         switch (lower) {
             case 'f': {
                 int p = precision < 0 ? 6 : precision;
-                String s = String.format("%." + p + "f", d);
+                String s = goFFormat(d, p);
                 if (altForm && p == 0) {
                     s += ".";
                 }
@@ -503,12 +611,11 @@ public final class Fmt {
             }
             case 'e': {
                 int p = precision < 0 ? 6 : precision;
-                String s = String.format("%." + p + (verb == 'E' ? "E" : "e"), d);
-                // Go 输出 e+09 形式，Java 输出 E+9，补齐指数位宽
-                return normalizeExponent(s, verb == 'E');
+                // Go 输出 e+09 形式（指数两位），goEFormat 内部已归一化
+                return goEFormat(d, p, verb == 'E');
             }
             case 'g': {
-                return goG(d, precision, verb == 'G');
+                return goG(d, precision, verb == 'G', altForm);
             }
             default:
                 return String.valueOf(d);
@@ -536,35 +643,239 @@ public final class Fmt {
         return mantissa + marker + (neg ? "-" : "+") + exp;
     }
 
-    /** Go 的 %g：在 %e 与 %f 中选择更紧凑的那个。 */
-    private static String goG(double d, int precision, boolean upper) {
-        int p = precision;
-        boolean hasPrecision = p >= 0;
-        if (p < 0 || p == 0) {
-            p = 1;
-        }
-
-        // 按 Go 规则：指数 < -4 或 >= precision 时用 %e
+    /**
+     * Go 的 %g：在 %e 与 %f 中选择更紧凑的那个。
+     *
+     * <p><b>未指定精度</b>（{@code precision < 0}，即 {@code %v} 与无精度的 {@code %g}）时，
+     * Go 交给 {@code strconv.FormatFloat(v, 'g', -1, 64)}：取最短往返表示，并按
+     * 「指数 &lt; -4 或 &gt;= 6」选型 —— strconv 在 shortest 分支把 eprec 固定为 6。
+     * 指数由十进制串精确解析得出，不用 {@code Math.log10}，避免边界上的浮点误差。
+     *
+     * <p><b>指定精度</b>时：{@code %g} 的 {@code prec == 0} 视为 1；且无论走 %e 还是 %f
+     * 分支都去掉尾随零（{@code #} 除外）—— 这是 %g 本身的性质，与精度无关。
+     *
+     * <p>已知偏差：指定精度时 Go 会用"舍入后的位数"再判一次 %e/%f 边界，本实现用原始
+     * 指数判定，只在舍入恰好跨过 10 的幂时可能不同；项目内无显式 {@code %g} 调用。
+     */
+    private static String goG(double d, int precision, boolean upper, boolean altForm) {
+        boolean neg = isNeg(d);
         double abs = Math.abs(d);
-        int exp10 = 0;
-        if (abs != 0) {
-            exp10 = (int) Math.floor(Math.log10(abs));
-        }
-        boolean useExp = exp10 < -4 || exp10 >= p;
+        ShortestDec dec = parseShortest(abs);
+        int exp10 = dec.dp() - 1;
 
-        String s;
-        if (useExp) {
-            s = normalizeExponent(String.format("%." + (p - 1) + (upper ? "E" : "e"), d), upper);
-        } else {
-            int frac = Math.max(0, p - 1 - exp10);
-            if (!hasPrecision) {
-                // 未指定精度时去掉多余的尾随零
-                s = trimFloat(String.format("%." + frac + "f", d));
+        // 未指定精度：最短往返表示 + eprec == 6
+        if (precision < 0) {
+            String s;
+            if (altForm) {
+                // %#g（未指定精度）：按 prec=6 渲染；但最短表示本身需要更多有效数字时
+                // 直接用最短表示，绝不四舍五入（Go 实测：12345.678 保持 8 位而非 12345.7）
+                s = sigDigits(dec) > 6
+                        ? ((exp10 < -4 || exp10 >= 6) ? gExp(dec, upper) : gFixed(dec))
+                        : gPrec(abs, exp10, 6, upper, true);
             } else {
-                s = String.format("%." + frac + "f", d);
+                s = (exp10 < -4 || exp10 >= 6) ? gExp(dec, upper) : gFixed(dec);
             }
+            return neg ? "-" + s : s;
         }
-        return s;
+
+        int p = precision == 0 ? 1 : precision;
+        String s = gPrec(abs, exp10, p, upper, altForm);
+        return neg ? "-" + s : s;
+    }
+
+    /**
+     * 按显式精度 {@code p} 渲染 %g：选型规则与 shortest 相同（指数 &lt; -4 或 &gt;= p 走 %e），
+     * 且 %e/%f 两支都去掉尾随零；{@code altForm} 时反过来保留尾随零，且结果没有小数点就补一个。
+     */
+    private static String gPrec(double abs, int exp10, int p, boolean upper, boolean altForm) {
+        if (exp10 < -4 || exp10 >= p) {
+            String s = goEFormat(abs, p - 1, upper);
+            return altForm ? ensureExpPoint(s, upper) : trimExpMantissa(s, upper);
+        }
+        int frac = Math.max(0, p - 1 - exp10);
+        String s = goFFormat(abs, frac);
+        if (altForm) {
+            return s.indexOf('.') < 0 ? s + "." : s;
+        }
+        return trimFloat(s);
+    }
+
+    /**
+     * Go 的 %f：对<b>精确二进制值</b>按<b>半到偶</b>（银行家）舍入。
+     *
+     * <p>Java 的 {@link String#format} 是半到上（half-up），两者只在恰好 .5 时不同：
+     * 实测 {@code %.0f} of {@code 1234.5} → Go {@code 1234}、Java 原为 {@code 1235}。
+     * 用精确值而非最短十进制串也是必须的：{@code %.2f} of {@code 2.675} 的精确值是
+     * 2.67499999…，故 Go 给 {@code 2.67}；若按最短串 2.675 当平局处理会错成 2.68。
+     *
+     * <p>负零（{@code -0.0}）保留符号，与 Go 用 {@code math.Signbit} 的行为一致。
+     */
+    private static String goFFormat(double d, int p) {
+        boolean neg = isNeg(d);
+        String s = new BigDecimal(Math.abs(d)).setScale(p, RoundingMode.HALF_EVEN).toPlainString();
+        return neg ? "-" + s : s;
+    }
+
+    /** 负号判定：与 Go 的 {@code v < 0 || math.Signbit(v)} 一致，负零也要带符号。 */
+    private static boolean isNeg(double d) {
+        return d < 0 || (d == 0 && Double.doubleToRawLongBits(d) < 0);
+    }
+
+    /**
+     * Go 的 %e：尾数按精确二进制值半到偶舍入到 {@code p} 位小数，指数补足两位。
+     *
+     * <p>舍入后尾数进位到 10 时重新归一化（如 9.9999995 → 1.000000e+01）。
+     */
+    private static String goEFormat(double d, int p, boolean upper) {
+        boolean neg = isNeg(d);
+        BigDecimal exact = new BigDecimal(Math.abs(d));
+        int e = 0;
+        BigDecimal mant = BigDecimal.ZERO;
+        if (exact.signum() != 0) {
+            e = exact.precision() - exact.scale() - 1;   // 科学记数法的十进制指数
+            mant = exact.scaleByPowerOfTen(-e).setScale(p, RoundingMode.HALF_EVEN);
+            if (mant.compareTo(BigDecimal.TEN) >= 0) {
+                // movePointLeft 会保值增位（10.000000 → 1.0000000），需复原到 p 位小数
+                e++;
+                mant = mant.movePointLeft(1).setScale(p, RoundingMode.HALF_EVEN);
+            }
+        } else {
+            mant = mant.setScale(p, RoundingMode.HALF_EVEN);
+        }
+        String s = mant.toPlainString();
+        if (neg) {
+            s = "-" + s;
+        }
+        return normalizeExponent(s + (upper ? 'E' : 'e') + (e < 0 ? '-' : '+') + Math.abs(e), upper);
+    }
+
+    /** 有效数字个数（跳过前导零；全为零时为 0）。 */
+    private static int sigDigits(ShortestDec dec) {
+        String ds = dec.digits();
+        int i = 0;
+        while (i < ds.length() && ds.charAt(i) == '0') {
+            i++;
+        }
+        return ds.length() - i;
+    }
+
+    /** Go 的 {@code #} 对 %e 分支：尾数没有小数点时补一个（如 4e+01 → 4.e+01）。 */
+    private static String ensureExpPoint(String s, boolean upper) {
+        char marker = upper ? 'E' : 'e';
+        int pos = s.indexOf(marker);
+        if (pos < 0) {
+            return s;
+        }
+        String mant = s.substring(0, pos);
+        return mant.indexOf('.') >= 0 ? s : mant + "." + s.substring(pos);
+    }
+
+    /** 最短往返十进制分解，满足 {@code 值 = 0.<digits> × 10^dp}。 */
+    private record ShortestDec(String digits, int dp) {
+    }
+
+    /**
+     * 把 {@link Double#toString} 的结果拆成（有效数字, 指数）。
+     *
+     * <p>{@code Double.toString} 保证给出唯一区分该值的最短十进制串，与 Go shortest 往返
+     * 表示一致；Java 的串里小数点前至少有一位数字，故需去掉整数部分的前导零才能定位小数点。
+     */
+    private static ShortestDec parseShortest(double abs) {
+        if (abs == 0) {
+            // Go 把 0 表示成 digits="0", dp=1（即 exp10 == 0），据此 %.6g 才得到 0.00000
+            return new ShortestDec("0", 1);
+        }
+        String s = Double.toString(abs);
+        long e = 0;
+        int eIdx = s.indexOf('E');
+        if (eIdx >= 0) {
+            e = Long.parseLong(s.substring(eIdx + 1));
+            s = s.substring(0, eIdx);
+        }
+        String intPart;
+        String fracPart;
+        int dot = s.indexOf('.');
+        if (dot >= 0) {
+            intPart = s.substring(0, dot);
+            fracPart = s.substring(dot + 1);
+        } else {
+            intPart = s;
+            fracPart = "";
+        }
+        int lead = 0;
+        while (lead < intPart.length() && intPart.charAt(lead) == '0') {
+            lead++;
+        }
+        int dp = (intPart.length() - lead) + (int) e;
+
+        StringBuilder sb = new StringBuilder(intPart.length() + fracPart.length());
+        sb.append(intPart, lead, intPart.length()).append(fracPart);
+        int end = sb.length();
+        while (end > 1 && sb.charAt(end - 1) == '0') {
+            end--;   // 去掉尾随零，至少保留一位
+        }
+        String digits = sb.substring(0, end);
+        if (digits.isEmpty()) {
+            digits = "0";
+            dp = 0;
+        }
+        return new ShortestDec(digits, dp);
+    }
+
+    /** %e 形态：{@code D[.ddd]e±dd}，指数固定两位。 */
+    private static String gExp(ShortestDec dec, boolean upper) {
+        String digits = dec.digits();
+        StringBuilder mant = new StringBuilder();
+        mant.append(digits.charAt(0));
+        if (digits.length() > 1) {
+            mant.append('.').append(digits, 1, digits.length());
+        }
+        int exp = dec.dp() - 1;
+        String raw = mant.toString() + (upper ? 'E' : 'e') + (exp < 0 ? '-' : '+') + Math.abs(exp);
+        return normalizeExponent(raw, upper);
+    }
+
+    /** %f 形态，按 {@code 0.<digits> × 10^dp} 还原整数与小数部分。 */
+    private static String gFixed(ShortestDec dec) {
+        String digits = dec.digits();
+        int dp = dec.dp();
+        if (dp <= 0) {
+            StringBuilder sb = new StringBuilder("0.");
+            for (int i = 0; i < -dp; i++) {
+                sb.append('0');
+            }
+            return sb.append(digits).toString();
+        }
+        int nd = digits.length();
+        if (dp >= nd) {
+            StringBuilder sb = new StringBuilder(digits);
+            for (int i = nd; i < dp; i++) {
+                sb.append('0');
+            }
+            return sb.toString();
+        }
+        return digits.substring(0, dp) + "." + digits.substring(dp);
+    }
+
+    /** 去掉 %e 尾串里尾数部分的尾随零（Go 的 %g 性质），指数位不动。 */
+    private static String trimExpMantissa(String s, boolean upper) {
+        char marker = upper ? 'E' : 'e';
+        int pos = s.indexOf(marker);
+        if (pos < 0) {
+            return s;
+        }
+        String mant = s.substring(0, pos);
+        if (mant.indexOf('.') < 0) {
+            return s;
+        }
+        int end = mant.length();
+        while (end > 1 && mant.charAt(end - 1) == '0') {
+            end--;
+        }
+        if (mant.charAt(end - 1) == '.') {
+            end--;
+        }
+        return mant.substring(0, end) + s.substring(pos);
     }
 
     private static String trimFloat(String s) {

@@ -77,6 +77,24 @@ public final class GoJson {
                 .withArrayIndenter(nl);
     }
 
+    /**
+     * 以 Go {@code json.Marshal(v)} 的格式序列化：单行紧凑，键值冒号后无空格
+     * （{@code {"a":1,"b":[1,2]}}），空容器 {@code {}}/{@code []}。
+     *
+     * <p>map 键顺序仍由 map 实现负责（Go 的 Marshal 会按键升序，需要排序时用
+     * {@link java.util.TreeMap}）。与 {@link #marshalIndent} 一样不做 Go 默认的
+     * HTML 转义；需要逐位复刻 Go 时由调用方自行处理。
+     *
+     * @return 序列化结果；失败返回 {@code null}（对应 Go {@code data, _ :=} 丢弃 error）
+     */
+    public static String marshal(Object v) {
+        try {
+            return MAPPER.writeValueAsString(v);
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
     /** 以 Go {@code json.MarshalIndent(v, "", "  ")} 的格式序列化。 */
     public static String marshalIndent(Object v) throws IOException {
         return MAPPER.writer(printer()).writeValueAsString(v);

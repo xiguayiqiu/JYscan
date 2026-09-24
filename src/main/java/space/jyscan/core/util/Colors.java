@@ -62,17 +62,147 @@ public final class Colors {
     // 底层
     // =====================================================================
 
-    /** 用 ANSI 码包裹文本；关闭颜色时原样返回。 */
+    /**
+     * 用 ANSI 码包裹文本（fatih/color 的 {@code Printf}/{@code Print} 语义，对应
+     * {@code Set(); Fprintf(...); defer unset()}）：合并为<b>单条</b> SGR 序列
+     * （如 {@code ESC[37;1m}，等价 fatih 的 {@code sequence()} 按参数顺序 ';'.join），
+     * unformat 恒为通用 {@code ESC[0m}（fatih 的 {@code Unset()}）。关闭颜色时原样返回。
+     *
+     * <p>注意：Go 的 deferred unset 在 Fprintf 之后触发，所以内嵌在文本里的
+     * 换行会出现在 format 与 unformat <b>之间</b>（本实现天然一致）。
+     */
     public static String wrap(String text, String... codes) {
-        if (!useColor || text == null || text.isEmpty() || codes == null || codes.length == 0) {
+        if (!useColor || text == null || codes == null || codes.length == 0) {
             return text;
         }
-        StringBuilder sb = new StringBuilder(text.length() + 16 * codes.length);
-        for (String c : codes) {
-            sb.append(c);
+        String fmt = formatSeq(codes);
+        if (fmt == null) {
+            fmt = String.join("", codes);
         }
-        sb.append(text).append(RESET);
-        return sb.toString();
+        return fmt + text + RESET;
+    }
+
+    /**
+     * fatih/color 的 {@code Println} 语义：{@code Fprintln(Output, c.wrap(sprintln(s)))}，
+     * 其中 {@code sprintln = TrimSuffix(Sprintln(s), "\n")}，wrap 的 unformat 按<b>每个参数</b>
+     * 查 fatih 的 {@code mapResetAttributes}（Bold/Faint→22、Italic→23、Underline→24、
+     * Blink→25、Reverse→27、Concealed→28、CrossedOut→29，颜色等其余→0）后 ';'.join。
+     * 即输出 {@code format + text + unformat}，<b>不含换行</b>（换行由调用方在
+     * unformat 之后补，与 fatih 的 Fprintln 一致）。关闭颜色时原样返回。
+     */
+    public static String wrapPrintln(String text, String... codes) {
+        if (!useColor || text == null || codes == null || codes.length == 0) {
+            return text;
+        }
+        String fmt = formatSeq(codes);
+        if (fmt == null) {
+            return text;
+        }
+        String unf = unformatSeq(codes);
+        return fmt + text + (unf.isEmpty() ? RESET : unf);
+    }
+
+    /**
+     * 合并 codes 为单条 SGR 开序列（等价 fatih 的 {@code format()} =
+     * {@code escape + sequence() + "m"}）。无法解析为纯 SGR 参数的 code 跳过；
+     * 若一个都解析不出则返回 {@code null}。前缀直接取自 {@link #RESET} 前两字符，
+     * 避免在源码里写字面转义。
+     */
+    private static String formatSeq(String... codes) {
+        StringBuilder sb = new StringBuilder(RESET.substring(0, 2));
+        boolean first = true;
+        for (String c : codes) {
+            String mid = sgrParams(c);
+            if (mid == null) {
+                continue;
+            }
+            for (String p : mid.split(";")) {
+                if (p.isEmpty()) {
+                    continue;
+                }
+                if (!first) {
+                    sb.append(';');
+                }
+                sb.append(p);
+                first = false;
+            }
+        }
+        if (first) {
+            return null;
+        }
+        return sb.append('m').toString();
+    }
+
+    /** 逐参数查 fatih 的 mapResetAttributes 后合并为单条复位序列；无参数时返回空串。 */
+    private static String unformatSeq(String... codes) {
+        StringBuilder sb = new StringBuilder(RESET.substring(0, 2));
+        boolean first = true;
+        for (String c : codes) {
+            String mid = sgrParams(c);
+            if (mid == null) {
+                continue;
+            }
+            for (String p : mid.split(";")) {
+                if (p.isEmpty()) {
+                    continue;
+                }
+                int attr;
+                try {
+                    attr = Integer.parseInt(p);
+                } catch (NumberFormatException e) {
+                    attr = -1;
+                }
+                if (!first) {
+                    sb.append(';');
+                }
+                sb.append(mapReset(attr));
+                first = false;
+            }
+        }
+        if (first) {
+            return "";
+        }
+        return sb.append('m').toString();
+    }
+
+    /** fatih/color 的 mapResetAttributes：属性→专属复位码；未收录（颜色等）→通用 Reset(0)。 */
+    private static int mapReset(int attr) {
+        switch (attr) {
+            case 1:  // Bold
+            case 2:  // Faint
+                return 22; // ResetBold
+            case 3:
+                return 23; // ResetItalic
+            case 4:
+                return 24; // ResetUnderline
+            case 5:  // BlinkSlow
+            case 6:  // BlinkRapid
+                return 25; // ResetBlinking
+            case 7:
+                return 27; // ResetReversed
+            case 8:
+                return 28; // ResetConcealed
+            case 9:
+                return 29; // ResetCrossedOut
+            default:
+                return 0;
+        }
+    }
+
+    /** 若 code 形如 SGR 码（前缀 = RESET 前两字符，中段仅 0-9 与 ';'，尾 'm'）则返回参数串。 */
+    private static String sgrParams(String code) {
+        if (code == null || code.length() < 4 || !code.startsWith(RESET.substring(0, 2))
+                || !code.endsWith("m")) {
+            return null;
+        }
+        String mid = code.substring(2, code.length() - 1);
+        for (int i = 0; i < mid.length(); i++) {
+            char ch = mid.charAt(i);
+            if ((ch < '0' || ch > '9') && ch != ';') {
+                return null;
+            }
+        }
+        return mid;
     }
 
     /** 等价于 color.Color.Sprintf。 */
