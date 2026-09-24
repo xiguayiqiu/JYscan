@@ -51,6 +51,7 @@
 - **密码学工具**
   - `crunch`：基于字符模式的字典生成功能
   - `cupp`：社会工程学辅助的密码生成
+  - `passwd`：密码字典获取（weakpass.com 字典列表与下载）
 - **网络扫描工具**
   - `dirscan`：网站目录扫描
   - `route`：路由跳数检测
@@ -140,6 +141,7 @@ mvn exec:java -Dexec.args="scan --help"
 | 通用 | about | 关于工具 |
 | 密码学工具 | crunch | 字典生成 |
 | 密码学工具 | cupp | 社工密码生成 |
+| 密码学工具 | passwd | weakpass 字典列表/下载 |
 | 网络扫描工具 | dirscan | 目录扫描 |
 | 网络扫描工具 | route | 路由跳数 |
 | 网络扫描工具 | scan | 网络扫描 |

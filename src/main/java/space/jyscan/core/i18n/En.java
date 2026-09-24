@@ -44,6 +44,7 @@ final class En {
         MESSAGES.put("cmd.linenum.short", "Linux local information enumeration");
         MESSAGES.put("cmd.crunch.short", "Wordlist generator based on character patterns");
         MESSAGES.put("cmd.cupp.short", "Social engineering password generator (CUPP)");
+        MESSAGES.put("cmd.passwd.short", "Password wordlist fetcher - weakpass list & download");
         MESSAGES.put("cmd.database.short", "Database password brute-forcer");
         MESSAGES.put("cmd.dirscan.short", "Website directory scanner");
         MESSAGES.put("cmd.dns.short", "DNS query tool with multiple record types and reverse lookup");

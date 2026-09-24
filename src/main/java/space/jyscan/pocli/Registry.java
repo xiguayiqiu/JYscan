@@ -3,6 +3,7 @@ package space.jyscan.pocli;
 import space.jyscan.pocli.commands.AboutCommand;
 import space.jyscan.pocli.commands.CrunchCommand;
 import space.jyscan.pocli.commands.CuppCommand;
+import space.jyscan.pocli.commands.PasswdCommand;
 import space.jyscan.pocli.commands.DirscanCommand;
 import space.jyscan.pocli.commands.ProcessCommand;
 import space.jyscan.pocli.commands.RouteCommand;
@@ -45,6 +46,7 @@ public final class Registry {
         // ==================== 密码 ====================
         register("crunch", CommandGroup.PASSWORD, new CrunchCommand());
         register("cupp", CommandGroup.PASSWORD, new CuppCommand());
+        register("passwd", CommandGroup.PASSWORD, new PasswdCommand());
 
         // ==================== 网络 ====================
         register("scan", CommandGroup.NETWORK, new ScanCommand());
