@@ -1,6 +1,7 @@
 package space.jyscan.modules.subdomain;
 
 import java.time.Duration;
+import java.util.List;
 
 /**
  * 子域名挖掘配置，对应 Go 的 {@code subdomain.SubdomainConfig}。
@@ -30,4 +31,10 @@ public final class SubdomainConfig {
 
     /** 是否校验 HTTP 响应以过滤无效子域名，对应 -H/--http（默认启用）。 */
     public boolean verifyHTTP = true;
+
+    /**
+     * 状态码白名单过滤（{@code --status-codes}，Java 侧新增、Go 无此 flag）；
+     * null/空 = 默认行为（状态码 &lt; 400 即通过）。仅在 {@link #verifyHTTP} 开启时生效。
+     */
+    public List<Integer> statusFilter;
 }

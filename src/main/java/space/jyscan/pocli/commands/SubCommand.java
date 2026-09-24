@@ -25,6 +25,10 @@ import java.util.concurrent.atomic.AtomicReference;
  * <p>flag 与默认值对齐：-d/--domain、-w/--wordlist、-t/--threads(50)、
  * -o/--timeout(3)、-f/--output、-T/--type(A)、-H/--http(true)、--no-http(false)。
  *
+ * <p>Java 侧新增 flag：{@code --status-codes} 状态码白名单过滤（Go 无此 flag；
+ * 与 dirscan 同名参数同语义，复用 {@code DirscanCommand.parseStatusCodes}，
+ * 仅在 HTTP 验证开启时生效）。
+ *
  * <p>与 Go 一致的两处「flag 实际不生效」语义（保持原样，不擅自改动）：
  * <ul>
  *   <li>位置参数缺失或首个是 {@code help} 时直接打印帮助，因此 -d 实际取不到值
@@ -56,6 +60,7 @@ import java.util.concurrent.atomic.AtomicReference;
                 "  ./jyscan sub example.com -w subdomains.txt",
                 "  ./jyscan sub example.com -w subdomains.txt -t 100",
                 "  ./jyscan sub example.com -T CNAME",
+                "  ./jyscan sub example.com --status-codes 200,301",
                 "",
                 "DNS查询类型说明:",
                 "  A:     IPv4地址记录",
@@ -77,7 +82,8 @@ import java.util.concurrent.atomic.AtomicReference;
                 "  -t, --threads:  并发线程数 (默认: 50)",
                 "  -o, --timeout:  超时时间(秒) (默认: 3)",
                 "  -f, --output:   结果输出文件",
-                "  -H, --http:     验证HTTP响应，过滤无效子域名 (默认启用)"
+                "  -H, --http:     验证HTTP响应，过滤无效子域名 (默认启用)",
+                "  --status-codes: 状态码过滤 (逗号分隔白名单，默认仅 <400 通过)"
         },
         synopsisHeading = "%n",
         sortOptions = false,
@@ -116,6 +122,12 @@ public class SubCommand implements Callable<Integer> {
     /** 禁用HTTP验证，对应 Go 的 --no-http。 */
     @Option(names = {"--no-http"}, description = "禁用HTTP验证")
     private boolean noVerifyHTTP;
+
+    /** 状态码白名单过滤（Java 侧新增，Go 无此 flag），与 dirscan 的 --status-codes 同名同语义。 */
+    @Option(names = {"--status-codes"},
+            description = "状态码过滤 (逗号分隔，如: 200,301,403；白名单语义，"
+                    + "默认仅 <400 通过；需开启 HTTP 验证，--no-http 时不生效)")
+    private String statusCodes;
 
     /** 位置参数：Go 要求第一个位置参数就是目标域名（或 help）。 */
     @Parameters(arity = "0..*", paramLabel = "ARGS", description = "位置参数：目标域名 / help")
@@ -158,6 +170,8 @@ public class SubCommand implements Callable<Integer> {
         config.output = output == null ? "" : output;
         config.queryType = queryType == null ? "A" : queryType;
         config.verifyHTTP = verifyHTTP && !noVerifyHTTP;
+        // 状态码白名单（Java 侧新增）：复用 dirscan 的解析（同包），无效项告警后跳过
+        config.statusFilter = DirscanCommand.parseStatusCodes(statusCodes);
 
         Colors.infoPrint("[JYscan-Subdomain] 开始扫描目标: %s", domain);
 

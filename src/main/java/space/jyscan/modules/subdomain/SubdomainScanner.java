@@ -55,6 +55,9 @@ import java.util.regex.Pattern;
  *       这里按 flag 文档让它参与查询（默认 A 时行为与 Go 完全一致）；</li>
  *   <li>{@code -f/--output}：Go 侧 {@code saveResults} 定义了但从未调用，输出文件永远不落盘；
  *       这里按 flag 文档在扫描结束后调用一次；</li>
+ *   <li>{@code --status-codes}：Java 侧新增的状态码白名单过滤（Go 无此 flag），
+ *       默认仍为「&lt; 400 即通过」，给定白名单后仅保留命中状态码的主机
+ *       （可借此纳入 403 等 ≥400 的码）；</li>
  *   <li>DNS 服务器：Go 硬编码 8.8.8.8；国内实测其丢包约 20%、RTT 均值 572ms
  *       （系统 resolver 24ms 零失败），在 1s 读超时下子域名被随机丢弃。
  *       这里改为系统 resolver 优先 + 8.8.8.8 兜底，失败自动换下一家；</li>
@@ -462,7 +465,9 @@ public final class SubdomainScanner {
     }
 
     /**
-     * HTTP 存活校验，对应 Go 的 {@code verifyHTTP}：先 http 再 https，状态码 &lt; 400 即通过。
+     * HTTP 存活校验，对应 Go 的 {@code verifyHTTP}：先 http 再 https。
+     * 默认状态码 &lt; 400 即通过；若配置了 {@code --status-codes} 白名单，
+     * 则仅命中白名单的状态码通过（可借此纳入 403 等 ≥400 的码）。
      *
      * <p>与 Go 的两点差异：
      * <ul>
@@ -502,8 +507,17 @@ public final class SubdomainScanner {
                         .header("User-Agent", "freeclient/1.0")
                         .build();
                 HttpResponse<Void> resp = client.send(req, HttpResponse.BodyHandlers.discarding());
-                if (resp.statusCode() < 400) {
-                    return resp.statusCode();
+                int code = resp.statusCode();
+                List<Integer> filter = config.statusFilter;
+                if (filter == null || filter.isEmpty()) {
+                    // 默认（与 Go 一致）：状态码 < 400 即通过
+                    if (code < 400) {
+                        return code;
+                    }
+                } else if (filter.contains(code)) {
+                    // --status-codes 白名单（Java 侧新增）：命中即通过，
+                    // 可包含 403 等 ≥400 的码；未命中则尝试下一个协议
+                    return code;
                 }
             } catch (Exception e) {
                 // 连接失败 / 超时：尝试下一个协议（与 Go 的 continue 一致）
@@ -534,6 +548,10 @@ public final class SubdomainScanner {
         }
         System.out.print("\r\u001b[K" + line + "\n");
         System.out.flush();
+        // 立即重画进度条：清行后若等下一个 tick，条会消失最长 200ms，
+        // 每次命中闪一下（用户报"进度条后闪烁"）。与 updateProgress 的
+        // 帧同持 mutex，两路输出不会交错。
+        drawProgressFrame();
     }
 
     /** 状态码着色：2xx 绿、3xx 黄、其余红（自 SubCommand 迁入，实时打印共用）。 */
@@ -560,32 +578,48 @@ public final class SubdomainScanner {
                 return;
             }
 
-            long scanned = scannedCount.get();
-            if (scanned >= totalWords) {
-                return;
-            }
-
-            double progress = (double) scanned / (double) totalWords * 100;
-            int width = 20;
-            int filled = (int) (progress / 100 * width);
-            if (filled > width) {
-                filled = width;
-            }
-
-            StringBuilder bar = new StringBuilder("[");
-            for (int i = 0; i < width; i++) {
-                if (i < filled - 1) {
-                    bar.append('=');
-                } else if (i == filled - 1) {
-                    bar.append('>');
-                } else {
-                    bar.append(' ');
+            // 与 printFoundLive 的「结果行 + 立即重画」持同一把锁，
+            // 避免两路输出交错打出半帧/重帧
+            synchronized (mutex) {
+                if (scannedCount.get() >= totalWords) {
+                    return;
                 }
+                drawProgressFrame();
             }
-            bar.append(']');
-
-            System.err.printf("\r%s %d/%d", bar, scanned, totalWords);
         }
+    }
+
+    /**
+     * 画一帧进度条到 stderr（{@code \r} 原地刷新），算法逐字符照搬 Go 的
+     * {@code updateProgress}。调用方必须持有 {@link #mutex}。
+     */
+    private void drawProgressFrame() {
+        long scanned = scannedCount.get();
+        if (totalWords <= 0) {
+            return;
+        }
+
+        double progress = (double) scanned / (double) totalWords * 100;
+        int width = 20;
+        int filled = (int) (progress / 100 * width);
+        if (filled > width) {
+            filled = width;
+        }
+
+        StringBuilder bar = new StringBuilder("[");
+        for (int i = 0; i < width; i++) {
+            if (i < filled - 1) {
+                bar.append('=');
+            } else if (i == filled - 1) {
+                bar.append('>');
+            } else {
+                bar.append(' ');
+            }
+        }
+        bar.append(']');
+
+        System.err.printf("\r%s %d/%d", bar, scanned, totalWords);
+        System.err.flush();
     }
 
     /** 保存结果，对应 Go 的 {@code saveResults}（Go 侧未被调用，见类注释的偏差说明）。 */
